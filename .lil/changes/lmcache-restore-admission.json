@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-restore-admission",
+  "category": "fix",
+  "summary": "Recurrent checkpoint restores wait for GPU and copy capacity instead of admitting requests to recompute cached prefixes.",
+  "models": ["all"],
+  "compatibility": "Requires the paired vLLM restore-admission change; deploy vLLM before enabling this LMCache change.",
+  "details": [
+    "Capacity waits retain the answered checkpoint lookup and do not consume the timeout for an unanswered directory request.",
+    "A local checkpoint evicted before admission triggers a fresh external lookup, while genuine misses and exhausted transfer retries retain recomputation fallback.",
+    "This change does not repair missing checkpoint pages in cache storage."
+  ],
+  "authors": ["ktsaou"],
+  "requires": ["vllm-restore-admission"]
+}

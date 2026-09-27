@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (  # noqa: E402
 from vllm.lora.request import LoRARequest  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.utils.hashing import sha256  # noqa: E402
+from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint  # noqa: E402
 from vllm.v1.core.kv_cache_manager import KVCacheManager  # noqa: E402
 from vllm.v1.core.kv_cache_utils import (  # noqa: E402
     get_request_block_hasher,
@@ -485,6 +486,11 @@ def test_worker_metadata_requires_bound_rank() -> None:
         "rejected-store-reused-request-id",
         "inflight-store-reused-request-id",
         "capacity-retry",
+        "capacity-timeout",
+        "task-capacity",
+        "local-hit-during-copy",
+        "invalidated-before-use",
+        "publication-invalidated",
     ],
 )
 def test_semantic_roundtrip_collective_visibility_and_cancellation(
@@ -503,6 +509,8 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                 "parallel": {"tp": 4, "dcp": 1},
             },
             4,
+            max_tasks=1 if outcome == "task-capacity" else 32,
+            lookup_timeout=0.05 if outcome == "capacity-timeout" else 60.0,
         )
         layout = {"schema_version": 1, "page_bytes": 128}
         bridge.accept_layouts({rank: layout for rank in range(4)})
@@ -591,30 +599,28 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
             assert roots and all(root.namespace == prefix.namespace for root in roots)
             assert sum(len(root.tail_tokens) for root in roots) >= prefix.num_tokens
             consumer = make_request("consumer")
-            if outcome == "capacity-retry":
-                # Ordinary admission may also fail while another request owns
-                # the pool. An available manifest must remain retryable until
-                # this consumer is admitted or cancelled.
+            if outcome in ("capacity-retry", "capacity-timeout"):
+                # Resource pressure must not authorize cold admission.
                 pressure = manager.block_pool.get_new_blocks(
                     manager.block_pool.get_num_free_blocks()
                 )
                 try:
-                    deadline = time.monotonic() + 5
-                    while not bridge.poll_prefix(consumer):
-                        assert time.monotonic() < deadline
+                    for _ in range(100):
+                        assert not bridge.poll_prefix(consumer)
                         time.sleep(0.001)
                     assert bridge.take_tasks() == []
-                    # Persistent pressure still permits ordinary admission;
-                    # retaining the manifest must not introduce a wait loop.
-                    assert bridge.poll_prefix(consumer)
+                    assert not bridge.poll_prefix(consumer)
                 finally:
                     manager.block_pool.free_blocks(pressure)
             inflight_store = None
-            if outcome == "inflight-store-reused-request-id":
+            if outcome in ("inflight-store-reused-request-id", "task-capacity"):
                 # This cancelled producer has different tokens but the same
                 # public ID as the waiting consumer. Its admitted copy is still
                 # live while the consumer looks up the first producer's data.
-                predecessor = make_request("consumer", first_token=20)
+                predecessor = make_request(
+                    "blocker" if outcome == "task-capacity" else "consumer",
+                    first_token=20,
+                )
                 predecessor_checkpoint = manager.reserve_external_boundary_checkpoint(
                     predecessor,
                     11,
@@ -675,8 +681,28 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
             assert len(tasks) == 1
             restore_task = tasks[0]
             assert manager.get_computed_blocks(consumer)[1] == 0
+            if outcome == "local-hit-during-copy":
+                local = make_request("local-producer")
+                local_checkpoint = manager.reserve_external_boundary_checkpoint(
+                    local,
+                    11,
+                    manager.boundary_checkpoint_page_positions(11),
+                    draft_prefix_len=11,
+                    kind="prompt",
+                    num_ranks=1,
+                )
+                assert local_checkpoint is not None
+                assert manager.acknowledge_external_boundary_checkpoint(
+                    local_checkpoint.checkpoint_id, 0
+                )
+                assert not bridge.poll_prefix(consumer)
             if outcome == "cancelled":
                 bridge.finish_request(consumer.request_id)
+            if outcome == "publication-invalidated":
+                assert manager.boundary_checkpoints is not None
+                manager.boundary_checkpoints.invalidate_block(
+                    restore_task.block_ids[-1][0]
+                )
             for rank in range(4):
                 future = worker.submit(
                     CheckpointTransferJob(
@@ -695,12 +721,32 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                     }
                 )
                 if rank < 3:
-                    assert manager.get_computed_blocks(consumer)[1] == 0
+                    if outcome != "local-hit-during-copy":
+                        assert manager.get_computed_blocks(consumer)[1] == 0
                     assert manager.block_pool.get_num_free_blocks() < before
-            assert manager.block_pool.get_num_free_blocks() == before
-            expected_tokens = 0 if outcome in ("rank-miss", "cancelled") else 11
+            expected_tokens = (
+                0
+                if outcome in ("rank-miss", "cancelled", "publication-invalidated")
+                else 11
+            )
+            if expected_tokens:
+                assert manager.block_pool.get_num_free_blocks() < before
+                assert not manager.reset_prefix_cache()
+            else:
+                assert manager.block_pool.get_num_free_blocks() == before
             assert manager.get_computed_blocks(consumer)[1] == expected_tokens
             assert bridge.external_tokens(consumer) == expected_tokens
+            if outcome == "invalidated-before-use":
+                # Preemption releases request ownership while its connector
+                # lookup state can still remember the previous successful import.
+                checkpoint = consumer.boundary_checkpoint
+                assert checkpoint is not None
+                manager.free(consumer)
+                assert manager.boundary_checkpoints is not None
+                manager.boundary_checkpoints.invalidate(checkpoint.checkpoint_id)
+                assert not bridge.poll_prefix(consumer)
+            bridge.finish_request(consumer.request_id)
+            assert manager.block_pool.get_num_free_blocks() == before
             if inflight_store is not None:
                 drain_predecessor()
             assert not bridge.has_pending
@@ -846,7 +892,108 @@ def make_bridge(client, manager, lookup_timeout: float) -> CheckpointSchedulerBr
     return bridge
 
 
-@pytest.mark.parametrize("reply", ["never", "error"])
+@pytest.mark.parametrize("prefix, already_local", [(11, False), (8, True)])
+def test_local_reuse_retries_external_restore_after_capacity_eviction(
+    prefix: int, already_local: bool
+) -> None:
+    """Losing a local selection must not turn an external hit into cold prefill."""
+    manager = make_manager()
+    manifest = None
+    lookups = 0
+
+    def submit(kind: RequestType, args: list[Any]) -> SimpleNamespace:
+        nonlocal manifest, lookups
+        if kind == RequestType.CHECKPOINT_BEGIN:
+            manifest = args[0]
+        if kind == RequestType.CHECKPOINT_FIND:
+            lookups += 1
+        result = manifest if kind == RequestType.CHECKPOINT_FIND else True
+        return SimpleNamespace(query=lambda: True, result=lambda: result)
+
+    bridge = make_bridge(SimpleNamespace(submit_request=submit), manager, 60)
+    producer = make_request("producer")
+
+    def publish() -> BoundaryCheckpoint:
+        checkpoint = manager.reserve_external_boundary_checkpoint(
+            producer,
+            prefix,
+            manager.boundary_checkpoint_page_positions(prefix),
+            draft_prefix_len=prefix,
+            kind="prompt",
+            num_ranks=1,
+        )
+        assert checkpoint is not None
+        assert manager.acknowledge_external_boundary_checkpoint(
+            checkpoint.checkpoint_id, 0
+        )
+        return checkpoint
+
+    checkpoint = publish()
+    bridge.store(producer, checkpoint)
+    (store,) = bridge.take_tasks()
+    bridge.complete({store.task_id: {rank: True for rank in range(4)}})
+    bridge.finish_request(producer.request_id)
+    assert manager.reset_prefix_cache()
+    consumer = make_request("consumer")
+    if already_local:
+        checkpoint = publish()
+    assert not bridge.poll_prefix(consumer)
+    if not already_local:
+        checkpoint = publish()
+    # Other requests occupy everything except the unpinned cached bundle.
+    pressure = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks() - len(checkpoint.dependencies)
+    )
+    assert bridge.poll_prefix(consumer)
+    blocks, tokens, _ = manager.get_computed_blocks(consumer)
+    assert tokens == prefix
+    assert bridge.external_tokens(consumer) == 0
+    assert bridge.poll_prefix(consumer)
+    assert lookups == 1
+    assert bridge.take_tasks() == []
+    assert (
+        manager.allocate_slots(
+            consumer,
+            1,
+            num_new_computed_tokens=tokens,
+            new_computed_blocks=blocks,
+            full_sequence_must_fit=True,
+        )
+        is None
+    )
+    # A running request grows into the cached bundle before capacity returns.
+    growth = manager.block_pool.get_new_blocks(1)
+    manager.block_pool.free_blocks(pressure + growth)
+    assert manager.get_computed_blocks(consumer)[1] == 0
+    assert not bridge.poll_prefix(consumer)
+    assert lookups == 2
+    assert not bridge.poll_prefix(consumer)
+    (restore,) = bridge.take_tasks()
+    bridge.complete({restore.task_id: {rank: True for rank in range(4)}})
+    assert bridge.poll_prefix(consumer)
+    blocks, tokens, _ = manager.get_computed_blocks(consumer)
+    assert tokens == prefix
+    assert bridge.external_tokens(consumer) == prefix
+    assert (
+        manager.allocate_slots(
+            consumer,
+            1,
+            num_new_computed_tokens=tokens,
+            new_computed_blocks=blocks,
+            full_sequence_must_fit=True,
+        )
+        is not None
+    )
+    _, copies = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(copies)
+    bridge.finish_request(consumer.request_id)
+    manager.free(consumer)
+    assert not bridge.has_pending
+    assert manager.external_boundary_reserved_blocks() == 0
+    assert manager.block_pool.get_num_free_blocks() == 63
+
+
+@pytest.mark.parametrize("reply", ["never", "error", "miss"])
 def test_lookup_without_a_usable_reply_admits_the_request(
     reply: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -859,7 +1006,10 @@ def test_lookup_without_a_usable_reply_admits_the_request(
         future = (
             SimpleNamespace(query=lambda: False, result=failed.result)
             if reply == "never"
-            else SimpleNamespace(query=lambda: True, result=failed.result)
+            else SimpleNamespace(
+                query=lambda: True,
+                result=(lambda: None) if reply == "miss" else failed.result,
+            )
         )
         consumer = make_request("consumer")
         with monkeypatch.context() as patch:
@@ -868,6 +1018,7 @@ def test_lookup_without_a_usable_reply_admits_the_request(
             if reply == "never":
                 assert not bridge.poll_prefix(consumer)
                 time.sleep(0.3)
+            assert bridge.poll_prefix(consumer)
             assert bridge.poll_prefix(consumer)
         assert bridge.take_tasks() == []
         assert bridge.external_tokens(consumer) == 0
