@@ -53,7 +53,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import attrgetter
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 import enum
 import select
 import threading
@@ -193,6 +193,19 @@ class PrefetchPhase(enum.Enum):
     PLAN_AND_LOAD = enum.auto()
 
 
+@dataclass(frozen=True)
+class PrefetchResult:
+    """Consumed prefetch outcome; reservation failure is not disk absence.
+
+    found indexes the requested keys. reservation_failed records allocation
+    failure or contention observed while reserving the actual load buffers.
+    A zero found bit alone does not distinguish absence from backend failure.
+    """
+
+    found: Bitmap
+    reservation_failed: bool = False
+
+
 @dataclass
 class InFlightPrefetchRequest:
     """Tracks a single prefetch request across its lifecycle phases."""
@@ -225,6 +238,7 @@ class InFlightPrefetchRequest:
     l2_adapter2readlocks: dict[int, Bitmap] = field(default_factory=dict)
     # True once the prefix hit was stored/published.
     hit_reported: bool = False
+    reservation_failed: bool = False
 
     # Load phase: adapter_idx -> bitmap of key indices to load
     load_plan: dict[int, Bitmap] = field(default_factory=dict)
@@ -273,6 +287,8 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The prefetch policy for load plan decisions.
         max_in_flight: Maximum number of concurrent prefetch requests.
+        replica_may_match: Optional predicate rejecting known payload-size
+            mismatches by adapter ID, key and expected logical bytes.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -289,6 +305,7 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
+        replica_may_match: Callable[[int, ObjectKey, int], bool] | None = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -300,6 +317,7 @@ class PrefetchController(StorageControllerInterface):
         }
         self._policy = policy
         self._max_in_flight = max_in_flight
+        self._replica_may_match = replica_may_match
         self._l1_eviction_controller: L1EvictionController | None = None
 
         # Adapters that are being drained and will be removed after all
@@ -338,6 +356,7 @@ class PrefetchController(StorageControllerInterface):
         self._prefetch_results_lock = threading.Lock()
         self._prefetch_results_cv = threading.Condition(self._prefetch_results_lock)
         self._completed_results: dict[PrefetchRequestId, Bitmap] = {}
+        self._completed_reservation_failures: set[PrefetchRequestId] = set()
 
         # Map eventfds to adapter indices for quick lookup in poll.
         # Relies on the L2AdapterInterface contract that every adapter
@@ -488,12 +507,26 @@ class PrefetchController(StorageControllerInterface):
             query_lookup_result after calling this function, otherwise it will
             get None forever.
         """
+        result = self.query_prefetch_result_detailed(request_id)
+        return result.found if result is not None else None
+
+    def query_prefetch_result_detailed(
+        self, request_id: PrefetchRequestId
+    ) -> PrefetchResult | None:
+        """Consume bitmap and allocation evidence atomically; None means pending.
+
+        This shares consumption with query_prefetch_result; both discard lookup
+        bookkeeping exactly once. No missing bitmap bit proves disk absence.
+        """
         with self._prefetch_results_lock:
-            result = self._completed_results.pop(request_id, None)
-        if result is not None:
-            with self._lookup_results_lock:
-                self._completed_lookups.pop(request_id, None)
-        return result
+            found = self._completed_results.pop(request_id, None)
+            if found is None:
+                return None
+            failed = request_id in self._completed_reservation_failures
+            self._completed_reservation_failures.discard(request_id)
+        with self._lookup_results_lock:
+            self._completed_lookups.pop(request_id, None)
+        return PrefetchResult(found, failed)
 
     def wait_prefetch_result(
         self, request_id: PrefetchRequestId, timeout: float
@@ -608,15 +641,25 @@ class PrefetchController(StorageControllerInterface):
         """
         Signal the loop to stop and wait for the thread to join.
 
-        Cleans up any in-flight requests (releases L1 write locks,
-        L2 locks) before returning.
+        Releases lookup locks, but active load destinations stay owned until
+        adapters drain and release_stopped_ownership is called.
         """
         self._stop_flag.set()
         self._submission_efd.notify()
         self._thread.join()
+        self._stopped_write_keys = [
+            key
+            for request in self._in_flight_requests.values()
+            for key in request.write_reserved_keys
+        ]
         self._cleanup_in_flight_requests()
         self._submission_efd.close()
         self._adapter_ctrl_efd.close()
+
+    def release_stopped_ownership(self) -> None:
+        """Release unpublished load destinations after all adapters have drained."""
+        self._discard_unloaded_buffers(self._stopped_write_keys)
+        self._stopped_write_keys = []
 
     def add_adapter(
         self,
@@ -1102,6 +1145,7 @@ class PrefetchController(StorageControllerInterface):
                 request.write_reserved_objs[key] = mem_obj
                 reserved.add(key)
                 continue
+            request.reservation_failed = True
             if err == L1Error.OUT_OF_MEMORY:
                 oom_keys.append(key)
             elif err == L1Error.KEY_NOT_WRITABLE:
@@ -1215,6 +1259,7 @@ class PrefetchController(StorageControllerInterface):
                     is_temporary=[not retention_map[key] for key in group_keys],
                     layout_desc=request.group_layout_descs[group_id],
                     mode="new",
+                    internal=True,
                 )
             )
         return results
@@ -1385,8 +1430,22 @@ class PrefetchController(StorageControllerInterface):
             )
             if result is None:
                 continue
-            request.lookup_results[adapter_idx] = result
             request.l2_adapter2readlocks[adapter_idx] = result
+            if self._replica_may_match is None:
+                request.lookup_results[adapter_idx] = result
+            else:
+                eligible = Bitmap(len(request.keys))
+                sizes = {
+                    group: get_size_bytes(layout.shapes, layout.dtypes)
+                    for group, layout in request.group_layout_descs.items()
+                }
+                for i, key in enumerate(request.keys):
+                    if result.test(i) and self._replica_may_match(
+                        adapter_idx, key, sizes[key.object_group_id]
+                    ):
+                        eligible.set(i)
+                # Preserve the original locks: rejected hits still need unlock.
+                request.lookup_results[adapter_idx] = eligible
             del request.pending_lookup_tasks[adapter_idx]
 
     def _poll_load_results(
@@ -1600,6 +1659,9 @@ class PrefetchController(StorageControllerInterface):
     def _complete_request(self, request_id: PrefetchRequestId, result: Bitmap) -> None:
         """Store the retained-key bitmap and remove from in-flight tracking."""
         with self._prefetch_results_lock:
+            request = self._in_flight_requests.get(request_id)
+            if request is not None and request.reservation_failed:
+                self._completed_reservation_failures.add(request_id)
             self._completed_results[request_id] = result
             # Wake any WAIT_PREFETCH_STATUS handler blocked on this result.
             self._prefetch_results_cv.notify_all()
@@ -1638,9 +1700,8 @@ class PrefetchController(StorageControllerInterface):
         """Release resources for any in-flight requests during shutdown."""
         l1_mgr = self._l1_manager
         for request in self._in_flight_requests.values():
-            if request.phase == PrefetchPhase.PLAN_AND_LOAD:
-                if request.write_reserved_keys:
-                    self._discard_unloaded_buffers(request.write_reserved_keys)
+            # An executing backend load can still write these reservations.
+            # release_stopped_ownership discards them after adapter teardown.
             self._release_l2_locks(request, keep={})
             if request.l1_readlocks.popcount() > 0:
                 l1_mgr.finish_read(

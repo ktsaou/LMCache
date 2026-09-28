@@ -103,12 +103,14 @@ def reserve_with_eviction_backpressure(
     if retry_wait_seconds <= 0:
         raise ValueError("retry_wait_seconds must be > 0")
 
-    generation = get_generation()
     first = attempt()
     if first.failure_reason is None:
         return AdmissionOutcome(first.value, None, retries=0, waited=False)
     if first.failure_reason is not AdmissionFailure.CAPACITY:
         return AdmissionOutcome(None, first.failure_reason, retries=0, waited=False)
+    # A failed atomic attempt rolls back its own partial allocations. Observe
+    # capacity afterwards so that rollback cannot wake an immediate busy loop.
+    generation = get_generation()
 
     on_wait()
     deadline = time.monotonic() + timeout_seconds
@@ -143,3 +145,4 @@ def reserve_with_eviction_backpressure(
             return AdmissionOutcome(
                 None, retried.failure_reason, retries=retries, waited=True
             )
+        generation = get_generation()

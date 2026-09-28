@@ -138,6 +138,7 @@ class L1EvictionController(EvictionController):
         self._event_bus = get_event_bus()
         self._last_extra_log = time.monotonic()
         self._immediate_request = threading.Event()
+        self._pressure_since: float | None = None
 
         self._write_back_enabled = eviction_config.write_back_on_evict
         self._periodic_backup_enabled = eviction_config.periodic_flush_interval > 0
@@ -209,7 +210,23 @@ class L1EvictionController(EvictionController):
 
     def _request_persist(self, to_persist: list[ObjectKey]) -> None:
         if self._retention is not None and to_persist:
-            self._retention.request_persist(list(dict.fromkeys(to_persist)))
+            keys = list(dict.fromkeys(to_persist))
+            retained = [key for key in keys if self._retention.is_retained(key)]
+            orphaned = [key for key in keys if key not in retained]
+            if orphaned:
+                self._delete_l1(orphaned)
+            self._retention.request_persist(retained)
+
+    def _delete_l1(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        if self._retention is not None:
+            result = self._retention.evict(keys, "l1", self._l1_manager.delete)
+        else:
+            result = self._l1_manager.delete(keys)
+        if any(error == L1Error.SUCCESS for error in result.values()):
+            self._reclamation_generation = (
+                getattr(self, "_reclamation_generation", 0) + 1
+            )
+        return result
 
     def _drop_superseded(self) -> int:
         """Evict superseded checkpoint pages from L1 before any LRU victim."""
@@ -223,14 +240,35 @@ class L1EvictionController(EvictionController):
         ][:_SUPERSEDED_DROP_BATCH]
         if not victims:
             return 0
-        result = self._l1_manager.delete(victims)
+        to_persist = [
+            key for key in victims if retention.needs_persist_before_evict(key)
+        ]
+        self._request_persist(to_persist)
+        result = self._delete_l1([key for key in victims if key not in to_persist])
         dropped = sum(1 for error in result.values() if error == L1Error.SUCCESS)
         retention.record_l1_superseded_drops(dropped)
         return dropped
 
     def request_immediate_eviction(self) -> None:
         """Wake the eviction loop for a capacity-blocked store."""
+        now = time.monotonic()
+        if (
+            getattr(self, "_pressure_since", None) is None
+            or now - getattr(self, "_last_pressure_request", 0.0) > 1.0
+        ):
+            self._pressure_since = now
+        self._last_pressure_request = now
         self._immediate_request.set()
+
+    def set_pressure_grace(self, seconds: float) -> None:
+        """Allocate part of the existing admission deadline to persistence."""
+        self._pressure_grace = max(0.0, seconds)
+        self._pressure_since = None
+
+    @property
+    def trigger_watermark(self) -> float:
+        """L1 pressure threshold used to reserve publication headroom."""
+        return self._eviction_config.trigger_watermark
 
     def stop(self) -> None:
         """Stop promptly even when the eviction loop is waiting."""
@@ -428,6 +466,7 @@ class L1EvictionController(EvictionController):
                 logger.exception("L1 eviction pass failed; retrying next pass")
 
     def _run_eviction_pass(self, immediate: bool) -> None:
+        reclamation = getattr(self, "_reclamation_generation", 0)
         self._l1_manager.reclaim_abandoned_writes()
         watermark = self._eviction_config.trigger_watermark
         eviction_ratio = self._eviction_config.eviction_ratio
@@ -436,7 +475,8 @@ class L1EvictionController(EvictionController):
         if self._eviction_config.extra_logging_enabled:
             self._maybe_log_memory_usage(used_bytes, total_bytes)
         usage = 0 if total_bytes == 0 else used_bytes / total_bytes
-        if usage < watermark:
+        if usage < watermark and not immediate:
+            self._pressure_since = None
             now = time.monotonic()
             if (
                 backup_interval > 0
@@ -469,6 +509,7 @@ class L1EvictionController(EvictionController):
         if self._drop_superseded():
             used_bytes, total_bytes = self._l1_manager.get_memory_usage()
             if total_bytes and used_bytes / total_bytes < watermark:
+                self._pressure_since = None
                 self._publish_triggered(usage, watermark)
                 return
         to_persist: list[ObjectKey] = []
@@ -479,6 +520,21 @@ class L1EvictionController(EvictionController):
         for action in actions:
             self.execute_eviction_action(action)
         self._request_persist(to_persist)
+        if getattr(self, "_reclamation_generation", 0) != reclamation:
+            self._pressure_since = None
+        pressure_since = getattr(self, "_pressure_since", None)
+        if (
+            immediate
+            and self._retention is not None
+            and pressure_since is not None
+            and time.monotonic() - pressure_since
+            >= getattr(self, "_pressure_grace", 1.0)
+        ):
+            retired_bytes = self._retention.retire_under_pressure(
+                max(1, int(total_bytes * eviction_ratio))
+            )
+            if retired_bytes:
+                self._pressure_since = None
         self._publish_triggered(usage, watermark)
 
     def execute_eviction_action(self, action: EvictionAction):
@@ -488,13 +544,13 @@ class L1EvictionController(EvictionController):
             else:
                 logger.error("L2 eviction destination requires writeback")
                 logger.error("Treating it as DISCARD.")
-                self._l1_manager.delete(action.keys)
+                self._delete_l1(action.keys)
         elif action.destination == EvictionDestination.DISCARD:
-            self._l1_manager.delete(action.keys)
+            self._delete_l1(action.keys)
         else:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
-            self._l1_manager.delete(action.keys)
+            self._delete_l1(action.keys)
 
     def emergency_evict_bytes(
         self,
@@ -595,6 +651,10 @@ class L1EvictionController(EvictionController):
                     break
 
             self._request_persist(to_persist)
+            if free < target_free_bytes:
+                # Continue through the same bounded pressure policy used by
+                # store admission while the prefetch caller retries for room.
+                self.request_immediate_eviction()
             evicted_keys = max(0, initial_objects - self._l1_manager.num_objects())
 
             logger.info(
@@ -750,7 +810,7 @@ class L1EvictionController(EvictionController):
             )
             return _SyncFlushResult.FAILURE
 
-        delete_result = self._l1_manager.delete(readable_keys)
+        delete_result = self._delete_l1(readable_keys)
         not_deleted = [
             key for key, error in delete_result.items() if error != L1Error.SUCCESS
         ]
@@ -1099,12 +1159,23 @@ class L2EvictionController(StorageControllerInterface):
     def _execute_eviction_action(
         self, adapter: L2AdapterInterface, action: EvictionAction
     ):
+        def delete(keys: list[ObjectKey]) -> None:
+            if self._retention is None:
+                adapter.delete(keys)
+                return
+            adapter_id = next(
+                state.adapter_id
+                for state in self._adapter_states
+                if state.adapter is adapter
+            )
+            self._retention.evict(keys, adapter_id, adapter.delete)
+
         if action.destination == EvictionDestination.DISCARD:
-            adapter.delete(action.keys)
+            delete(action.keys)
         else:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
-            adapter.delete(action.keys)
+            delete(action.keys)
 
         if action.keys:
             get_event_bus().publish(

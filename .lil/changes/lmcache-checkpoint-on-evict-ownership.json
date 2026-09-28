@@ -1,0 +1,15 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-checkpoint-on-evict-ownership",
+  "category": "fix",
+  "summary": "Keep deferred checkpoint storage coherent under memory and disk pressure",
+  "models": ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"],
+  "compatibility": "No user action required.",
+  "details": [
+    "Checkpoint publication and active transfers retain their pages until completion; supersession alone no longer discards an older branch's unwritten pages.",
+    "Persistence queues are bounded by allocated bytes, shared pages are deduplicated, and transient failures retry missing copies.",
+    "Sustained memory pressure can retire cold checkpoints before reclaiming their last copy. Shutdown drains writes within its budget and removes incomplete entries; restart validates recovered payload availability."
+  ],
+  "authors": ["ktsaou"],
+  "requires": ["b12x-checkpoint-shutdown-order"]
+}

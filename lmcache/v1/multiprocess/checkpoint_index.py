@@ -8,6 +8,7 @@ retrieved successfully before the serving engine can publish restored state.
 """
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
@@ -172,7 +173,11 @@ class CheckpointIndex:
         self._max_entries = max_entries
         self._max_pending = max_pending
         self._pending: dict[str, _PendingManifest] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._listeners: list[Callable[[str, CheckpointManifest | str], None]] = []
+        self._close_callbacks: list[Callable[[], None]] = []
+        self._closed = False
+        self._closing = False
         self._db = sqlite3.connect(
             str(path) if path is not None else ":memory:", check_same_thread=False
         )
@@ -234,6 +239,42 @@ class CheckpointIndex:
             "SELECT COALESCE(MAX(access_order), 0) FROM checkpoints"
         ).fetchone()[0]
 
+    @property
+    def lifecycle_lock(self) -> threading.RLock:
+        """Serialize directory mutations with payload ownership transitions.
+
+        Callers must not wait for capacity or backend I/O while holding this
+        reentrant lock. L1 callbacks must never acquire it.
+        """
+        return self._lock
+
+    def add_lifecycle_listener(
+        self,
+        listener: Callable[[str, CheckpointManifest | str], None],
+        before_close: Callable[[], None],
+    ) -> None:
+        """Subscribe to committed changes under the lifecycle lock.
+
+        Events are publish/touch (manifest) and remove/abort (generation).
+        The close callback runs outside the lock while SQLite is still open.
+        Listeners must be nonblocking and must not raise.
+        """
+        with self._lock:
+            self._listeners.append(listener)
+            self._close_callbacks.append(before_close)
+
+    def manifests(self) -> list[CheckpointManifest]:
+        """Return published manifests ordered from least to most recently used."""
+        with self._lock:
+            generations = self._db.execute(
+                "SELECT generation FROM checkpoints ORDER BY access_order"
+            ).fetchall()
+            return [
+                manifest
+                for (generation,) in generations
+                if (manifest := self.get(generation)) is not None
+            ]
+
     def begin(self, manifest: CheckpointManifest) -> bool:
         """Stage a complete manifest before rank acknowledgements arrive.
 
@@ -252,6 +293,8 @@ class CheckpointIndex:
         """
         with self._lock:
             pending = self._pending.get(manifest.generation)
+            if self._closing:
+                return False
             if pending is not None:
                 if pending.manifest != manifest:
                     raise ValueError("checkpoint generation changed during store")
@@ -309,6 +352,19 @@ class CheckpointIndex:
             self._access_order += 1
             tail = json.dumps(prefix.tail_tokens).encode()
             with self._db:
+                removed = [
+                    row[0]
+                    for row in self._db.execute(
+                        "SELECT generation FROM checkpoints WHERE namespace=? "
+                        "AND start_tokens=? AND prefix_hash=? AND tail=?",
+                        (
+                            prefix.namespace,
+                            prefix.start_tokens,
+                            prefix.prefix_hash,
+                            tail,
+                        ),
+                    )
+                ]
                 # The generation replaced for this exact prefix, if any.
                 self._db.execute(
                     "DELETE FROM checkpoint_tails WHERE generation IN ("
@@ -340,6 +396,14 @@ class CheckpointIndex:
                         _prefix_hashes(prefix.tail_tokens)[-1],
                     ),
                 )
+                removed.extend(
+                    row[0]
+                    for row in self._db.execute(
+                        "SELECT generation FROM checkpoints ORDER BY access_order DESC "
+                        "LIMIT -1 OFFSET ?",
+                        (self._max_entries,),
+                    )
+                )
                 for table in ("checkpoint_tails", "checkpoints"):
                     self._db.execute(
                         f"DELETE FROM {table} WHERE generation IN ("
@@ -348,6 +412,9 @@ class CheckpointIndex:
                         (self._max_entries,),
                     )
             del self._pending[generation]
+            for retired in removed:
+                self._notify("remove", retired)
+            self._notify("publish", manifest)
             return True
 
     def is_pending(self, manifest: CheckpointManifest) -> bool:
@@ -415,6 +482,7 @@ class CheckpointIndex:
                         "UPDATE checkpoints SET access_order=? WHERE generation=?",
                         (self._access_order, best.generation),
                     )
+                self._notify("touch", best)
             return best
 
     def get(self, generation: str) -> CheckpointManifest | None:
@@ -493,6 +561,7 @@ class CheckpointIndex:
             ]
             for generation in stale:
                 del self._pending[generation]
+                self._notify("abort", generation)
         return stale
 
     def abort(self, generation: str) -> None:
@@ -503,6 +572,7 @@ class CheckpointIndex:
         """
         with self._lock:
             self._pending.pop(generation, None)
+            self._notify("abort", generation)
 
     def invalidate(self, generation: str) -> None:
         """Remove only the generation whose payload retrieval failed.
@@ -511,11 +581,13 @@ class CheckpointIndex:
             generation: Failed generation, not merely its shared token prefix.
                 Invalidating a replaced generation cannot remove its replacement.
         """
-        with self._lock, self._db:
-            for table in ("checkpoint_tails", "checkpoints"):
-                self._db.execute(
-                    f"DELETE FROM {table} WHERE generation=?", (generation,)
-                )
+        with self._lock:
+            with self._db:
+                for table in ("checkpoint_tails", "checkpoints"):
+                    self._db.execute(
+                        f"DELETE FROM {table} WHERE generation=?", (generation,)
+                    )
+            self._notify("remove", generation)
 
     def report_status(self) -> dict[str, int]:
         """Return directory counts without asserting that payload pages are resident.
@@ -535,5 +607,18 @@ class CheckpointIndex:
     def close(self) -> None:
         """Discard pending generations and close the database connection."""
         with self._lock:
+            if self._closed:
+                return
+            self._closing = True
+        for callback in self._close_callbacks:
+            callback()
+        with self._lock:
+            for generation in list(self._pending):
+                self._notify("abort", generation)
             self._pending.clear()
             self._db.close()
+            self._closed = True
+
+    def _notify(self, event: str, value: CheckpointManifest | str) -> None:
+        for listener in self._listeners:
+            listener(event, value)

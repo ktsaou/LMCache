@@ -332,12 +332,12 @@ class StorageManagerConfig:
     """ Total deadline for capacity-only L1 store admission retries. """
 
     checkpoint_shutdown_flush_seconds: float = 30.0
-    """ With write-on-evict checkpoint storage, time budget for writing
-    current checkpoint pages still in L1 to L2 during a clean shutdown. """
+    """ Time budget to drain checkpoint persistence during clean shutdown.
+    On-evict also initiates writes of retained RAM-only checkpoint pages. """
 
     checkpoint_write_timeout_seconds: float = 120.0
-    """ With write-on-evict checkpoint storage, how long L1 keeps a page
-    whose L2 write has not completed before evicting it without a copy. """
+    """ Legacy compatibility setting; elapsed write time no longer permits
+    reclaiming an active buffer. Capacity pressure uses the admission deadline. """
 
     def __post_init__(self) -> None:
         if self.store_admission_timeout_seconds < 0:
@@ -601,17 +601,17 @@ def add_storage_manager_args(
         "--checkpoint-shutdown-flush-seconds",
         type=float,
         default=30.0,
-        help="With --l2-store-policy checkpoint_on_evict, time budget for "
-        "writing current recurrent checkpoints still in L1 to L2 on a clean "
-        "shutdown. 0 skips the flush.",
+        help="Time budget to drain recurrent checkpoint persistence on clean "
+        "shutdown. on-evict also starts writes for retained RAM-only pages. "
+        "0 skips the flush; incomplete checkpoints may be lost.",
     )
     parser.add_argument(
         "--checkpoint-write-timeout-seconds",
         type=float,
         default=120.0,
-        help="With --l2-store-policy checkpoint_on_evict, how long L1 keeps a "
-        "checkpoint page whose L2 write has not completed before evicting it "
-        "without an L2 copy.",
+        help="Legacy compatibility option; no longer releases pages by write age. "
+        "Capacity pressure may retire checkpoints within the store admission "
+        "deadline, but active I/O retains its buffers until completion.",
     )
 
     # L2 Policies

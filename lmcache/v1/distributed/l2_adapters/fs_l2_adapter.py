@@ -12,6 +12,8 @@ reversible path components so restart inventory retains the complete key.
 from __future__ import annotations
 
 # Standard
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 import asyncio
@@ -486,6 +488,10 @@ class FSL2Adapter(L2AdapterInterface):
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
         self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closing = False
+        self._closed = False
+        self._key_operations: dict[ObjectKey, tuple[asyncio.Lock, int]] = {}
 
         # Background asyncio event loop
         self._loop = asyncio.new_event_loop()
@@ -525,12 +531,13 @@ class FSL2Adapter(L2AdapterInterface):
         objects: list[MemoryObj],
     ) -> L2TaskId:
         with self._lock:
+            if self._closing:
+                raise RuntimeError("filesystem adapter is closing")
             task_id = self._get_next_task_id()
-
-        asyncio.run_coroutine_threadsafe(
-            self._execute_store(keys, objects, task_id),
-            self._loop,
-        )
+            asyncio.run_coroutine_threadsafe(
+                self._execute_store(keys, objects, task_id),
+                self._loop,
+            )
         return task_id
 
     def pop_completed_store_tasks(
@@ -556,12 +563,13 @@ class FSL2Adapter(L2AdapterInterface):
         self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
     ) -> L2TaskId:
         with self._lock:
+            if self._closing:
+                raise RuntimeError("filesystem adapter is closing")
             task_id = self._get_next_task_id()
-
-        asyncio.run_coroutine_threadsafe(
-            self._execute_lookup(keys, task_id),
-            self._loop,
-        )
+            asyncio.run_coroutine_threadsafe(
+                self._execute_lookup(keys, task_id),
+                self._loop,
+            )
         return task_id
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -583,12 +591,13 @@ class FSL2Adapter(L2AdapterInterface):
         objects: list[MemoryObj],
     ) -> L2TaskId:
         with self._lock:
+            if self._closing:
+                raise RuntimeError("filesystem adapter is closing")
             task_id = self._get_next_task_id()
-
-        asyncio.run_coroutine_threadsafe(
-            self._execute_load(keys, objects, task_id),
-            self._loop,
-        )
+            asyncio.run_coroutine_threadsafe(
+                self._execute_load(keys, objects, task_id),
+                self._loop,
+            )
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -609,6 +618,37 @@ class FSL2Adapter(L2AdapterInterface):
             "event_loop_alive": self._loop_thread.is_alive(),
         }
 
+    def has_complete_inventory(self) -> bool:
+        """The local filesystem can enumerate all persisted payloads."""
+        return True
+
+    def get_existing_key_sizes(self) -> dict[ObjectKey, int]:
+        """Inventory atomically published objects for checkpoint recovery.
+
+        Called before the adapter is exposed to serving or eviction. Temporary
+        files and unrecognized layouts are excluded; external file corruption
+        still requires ordinary restore validation.
+        """
+        inventory = {}
+        for path in self._base_path.rglob("*.data"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(self._base_path)
+            key = (
+                _filename_to_object_key(path.name)
+                if len(relative.parts) == 1
+                else _bounded_relative_path_to_object_key(relative)
+            )
+            if key is None:
+                continue
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue
+            if size > 0:
+                inventory[key] = size
+        return inventory
+
     # ------------------------------------------------------------------
     # Eviction Interface
     # ------------------------------------------------------------------
@@ -620,23 +660,20 @@ class FSL2Adapter(L2AdapterInterface):
             keys: The object keys to delete.
 
         Note:
-            No per-key locks: a delete racing a load turns that load
-            into a miss; racing a store of the same key may leave the
-            key re-stored.
+            Same-key stores and deletes include their residency notification
+            in one ordered operation. Concurrent loads may observe a miss.
         """
         if not keys:
             return
-        try:
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("filesystem adapter is closing")
             fut = asyncio.run_coroutine_threadsafe(
-                self._execute_delete(keys),
-                self._loop,
+                self._execute_delete(keys), self._loop
             )
-            deleted_keys, deleted_sizes = fut.result(timeout=30.0)
-        except Exception as e:
-            logger.warning("FSL2Adapter delete failed: %s", e)
-            return
-        if deleted_keys:
-            self._notify_keys_deleted(deleted_keys, deleted_sizes)
+        # The coroutine publishes deletion before releasing its per-key lock.
+        # Closure drains accepted operations rather than cancelling active I/O.
+        fut.result()
 
     # ``get_usage()`` is inherited from ``L2AdapterInterface``. The base
     # class maintains byte totals via ``_notify_keys_stored`` /
@@ -650,32 +687,33 @@ class FSL2Adapter(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        async def _stop_tasks():
+        """Fence submissions and drain accepted I/O before releasing resources."""
+
+        async def drain() -> None:
             tasks = [
-                t
-                for t in asyncio.all_tasks(self._loop)
-                if t is not asyncio.current_task()
+                task
+                for task in asyncio.all_tasks(self._loop)
+                if task is not asyncio.current_task()
             ]
-            for task in tasks:
-                task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            await self._loop.shutdown_default_executor()
 
-        if self._loop.is_running():
-            fut = asyncio.run_coroutine_threadsafe(_stop_tasks(), self._loop)
-            try:
-                fut.result(timeout=5)
-            except Exception:
-                pass
-            self._loop.call_soon_threadsafe(self._loop.stop)
-
-        self._loop_thread.join()
-        self._loop.close()
-
-        self._store_efd.close()
-        self._lookup_efd.close()
-        self._load_efd.close()
-        logger.info("FSL2Adapter closed")
+        with self._close_lock:
+            if self._closed:
+                return
+            with self._lock:
+                self._closing = True
+            if self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(drain(), self._loop).result()
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join()
+            self._loop.close()
+            self._store_efd.close()
+            self._lookup_efd.close()
+            self._load_efd.close()
+            self._closed = True
+            logger.info("FSL2Adapter closed")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -842,6 +880,21 @@ class FSL2Adapter(L2AdapterInterface):
                 except OSError:
                     pass
 
+    @asynccontextmanager
+    async def _key_operation(self, key: ObjectKey) -> AsyncIterator[None]:
+        """Order I/O and replica notifications; retain locks only while in use."""
+        lock, users = self._key_operations.get(key, (asyncio.Lock(), 0))
+        self._key_operations[key] = (lock, users + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            _, users = self._key_operations[key]
+            if users == 1:
+                del self._key_operations[key]
+            else:
+                self._key_operations[key] = (lock, users - 1)
+
     # ---- store ----------------------------------------------------------
 
     async def _execute_store(
@@ -852,83 +905,80 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> None:
         success = True
         bytes_written = 0
-        stored_keys: list[ObjectKey] = []
-        stored_sizes: list[int] = []
         try:
             for key, obj in zip(keys, objects, strict=True):
-                # Skip if already stored on disk
-                if await self._existing_key_path(key) is not None:
-                    continue
-                file_path, tmp_template = self._key_to_file_and_tmp_path(key)
-                buf = obj.byte_array
-                size = len(buf)
-                tmp_path = tmp_template.with_name(
-                    f"{tmp_template.name}.{os.getpid()}.{uuid.uuid4().hex}"
-                )
-                self._require_representable_path(tmp_path)
-                file_path.parent.mkdir(parents=True, exist_ok=True)
+                async with self._key_operation(key):
+                    # Skip if already stored on disk
+                    if await self._existing_key_path(key) is not None:
+                        continue
+                    file_path, tmp_template = self._key_to_file_and_tmp_path(key)
+                    buf = obj.byte_array
+                    size = len(buf)
+                    tmp_path = tmp_template.with_name(
+                        f"{tmp_template.name}.{os.getpid()}.{uuid.uuid4().hex}"
+                    )
+                    self._require_representable_path(tmp_path)
+                    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-                try:
-                    # Decide whether O_DIRECT is usable
-                    do_odirect = self._use_odirect
-                    if do_odirect:
-                        aligned = self._os_disk_bs > 0 and size % self._os_disk_bs == 0
-                        if not aligned:
-                            logger.warning(
-                                "Cannot use O_DIRECT for "
-                                "writing size %d, not "
-                                "aligned to block size "
-                                "%d.",
-                                size,
-                                self._os_disk_bs,
+                    try:
+                        # Decide whether O_DIRECT is usable
+                        do_odirect = self._use_odirect
+                        if do_odirect:
+                            aligned = (
+                                self._os_disk_bs > 0 and size % self._os_disk_bs == 0
                             )
-                            do_odirect = False
+                            if not aligned:
+                                logger.warning(
+                                    "Cannot use O_DIRECT for "
+                                    "writing size %d, not "
+                                    "aligned to block size "
+                                    "%d.",
+                                    size,
+                                    self._os_disk_bs,
+                                )
+                                do_odirect = False
 
-                    if do_odirect:
-                        await self._loop.run_in_executor(
-                            None,
-                            self._write_with_odirect,
-                            tmp_path,
-                            buf,
-                        )
-                    else:
-                        async with aiofiles.open(tmp_path, "xb") as f:
-                            await f.write(buf)
+                        if do_odirect:
+                            await self._loop.run_in_executor(
+                                None,
+                                self._write_with_odirect,
+                                tmp_path,
+                                buf,
+                            )
+                        else:
+                            async with aiofiles.open(tmp_path, "xb") as f:
+                                await f.write(buf)
 
-                    published = await self._loop.run_in_executor(
-                        None, _publish_temp_file, tmp_path, file_path
-                    )
-                    if published:
-                        bytes_written += size
-                        stored_keys.append(key)
-                        stored_sizes.append(size)
-                        logger.debug(
-                            "FSL2Adapter stored key %s (%d bytes)",
-                            file_path.name,
-                            size,
+                        published = await self._loop.run_in_executor(
+                            None, _publish_temp_file, tmp_path, file_path
                         )
-                    else:
-                        logger.debug(
-                            "FSL2Adapter duplicate store kept existing key %s",
-                            file_path.name,
+                        if published:
+                            bytes_written += size
+                            self._notify_keys_stored([key], [size])
+                            logger.debug(
+                                "FSL2Adapter stored key %s (%d bytes)",
+                                file_path.name,
+                                size,
+                            )
+                        else:
+                            logger.debug(
+                                "FSL2Adapter duplicate store kept existing key %s",
+                                file_path.name,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "FSL2Adapter failed to store %s",
+                            file_path,
                         )
-                except Exception:
-                    logger.exception(
-                        "FSL2Adapter failed to store %s",
-                        file_path,
-                    )
-                    if await aiofiles.os.path.exists(tmp_path):
-                        await aiofiles.os.unlink(tmp_path)
-                    success = False
+                        if await aiofiles.os.path.exists(tmp_path):
+                            await aiofiles.os.unlink(tmp_path)
+                        success = False
         except Exception:
             logger.exception(
                 "FSL2Adapter store task %s failed",
                 task_id,
             )
             success = False
-
-        if stored_keys:
-            self._notify_keys_stored(stored_keys, stored_sizes)
 
         with self._lock:
             self._completed_store_tasks[task_id] = L2StoreResult(success, bytes_written)
@@ -1056,26 +1106,28 @@ class FSL2Adapter(L2AdapterInterface):
         sem = asyncio.Semaphore(self._DELETE_CONCURRENCY)
 
         async def _delete_one(key: ObjectKey) -> tuple[ObjectKey, int] | None:
-            try:
-                file_path = await self._existing_key_path(key)
-            except ValueError:
-                logger.exception("FSL2Adapter rejected unrepresentable key %s", key)
-                return None
-            if file_path is None:
-                return None
-            async with sem:
+            async with self._key_operation(key):
                 try:
-                    size = (await aiofiles.os.stat(file_path)).st_size
-                    await aiofiles.os.unlink(file_path)
-                except FileNotFoundError:
+                    file_path = await self._existing_key_path(key)
+                except ValueError:
+                    logger.exception("FSL2Adapter rejected unrepresentable key %s", key)
                     return None
-                except Exception:
-                    logger.exception(
-                        "FSL2Adapter failed to delete %s",
-                        file_path,
-                    )
+                if file_path is None:
                     return None
-            return key, size
+                async with sem:
+                    try:
+                        size = (await aiofiles.os.stat(file_path)).st_size
+                        await aiofiles.os.unlink(file_path)
+                    except FileNotFoundError:
+                        return None
+                    except Exception:
+                        logger.exception(
+                            "FSL2Adapter failed to delete %s",
+                            file_path,
+                        )
+                        return None
+                self._notify_keys_deleted([key], [size])
+                return key, size
 
         results = await asyncio.gather(*(_delete_one(k) for k in keys))
 

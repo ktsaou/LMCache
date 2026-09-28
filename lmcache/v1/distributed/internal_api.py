@@ -46,6 +46,18 @@ class L1ManagerListener(EventListener):
     Listener for L1 manager events
     """
 
+    def on_l1_committed_objects(
+        self, keys: list[ObjectKey], sizes: list[int]
+    ) -> list[ObjectKey]:
+        """Accept ownership before committed pages become evictable.
+
+        Runs under the L1 lock; never call L1 from this callback. Returned
+        keys acquire one non-expiring internal pin, which the listener must
+        eventually release after its work drains. Default listeners own none.
+        """
+        self.on_l1_keys_write_finished(keys)
+        return []
+
     @abstractmethod
     def on_l1_keys_reserved_read(self, keys: list[ObjectKey]):
         """

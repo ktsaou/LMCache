@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Leases and pending generations of a dead worker are eventually released."""
+"""Stale metadata may expire; exposed copy buffers require drained completion."""
 
 # Standard
 from dataclasses import replace
@@ -21,7 +21,7 @@ from tests.v1.multiprocess.test_checkpoint_storage import (
 ABANDONED_AFTER = 0.2
 
 
-def test_abandoned_store_lease_and_generation_are_released() -> None:
+def test_abandoned_store_metadata_expires_but_copy_buffers_stay_owned() -> None:
     with open_store() as (_service, index, _storage, _mapping):
         service = CheckpointPayloadStore(
             _storage, index, abandoned_after_seconds=ABANDONED_AFTER
@@ -35,7 +35,9 @@ def test_abandoned_store_lease_and_generation_are_released() -> None:
         time.sleep(ABANDONED_AFTER + 0.1)
         assert service.reclaim_abandoned() == 1
         status = service.report_status()
-        assert status["store_leases"] == 0
+        assert status["store_leases"] == 1
+        keys = [key for group in checkpoint_object_keys(entry, 0) for key in group]
+        assert _storage.delete_l1_keys(keys)[0] == 0
         assert index.report_status()["pending_generations"] == 0
         assert not service.finish_store(lease.lease_id, True)
         # The generation can be staged and stored again.
@@ -58,7 +60,7 @@ def test_pending_generation_without_a_lease_is_released() -> None:
         assert index.begin(entry)
 
 
-def test_abandoned_ready_retrieve_releases_its_read_locks() -> None:
+def test_abandoned_ready_retrieve_keeps_copy_ownership() -> None:
     with open_store() as (_service, index, storage, mapping):
         service = CheckpointPayloadStore(
             storage, index, abandoned_after_seconds=ABANDONED_AFTER
@@ -76,8 +78,10 @@ def test_abandoned_ready_retrieve_releases_its_read_locks() -> None:
         # The reader holds the pages until it releases them.
         assert storage.delete_l1_keys(keys)[0] == 0
         time.sleep(ABANDONED_AFTER + 0.1)
-        assert service.reclaim_abandoned() == 1
-        assert service.report_status()["retrieve_leases"] == 0
+        assert service.reclaim_abandoned() == 0
+        assert service.report_status()["retrieve_leases"] == 1
+        assert storage.delete_l1_keys(keys)[0] == 0
+        service.finish_retrieve(lease_id)
         assert storage.delete_l1_keys(keys)[0] == len(keys)
 
 

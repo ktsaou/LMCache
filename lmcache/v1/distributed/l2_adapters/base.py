@@ -668,6 +668,13 @@ class L2AdapterInterface(ABC):
         """
         return _EMPTY_KEY_SIZES
 
+    def has_complete_inventory(self) -> bool:
+        """Whether a successful inventory snapshot proves absent keys missing.
+
+        Remote backends without a complete inventory require lookup validation.
+        """
+        return False
+
     def _initialize_usage(self, key_sizes: Mapping[ObjectKey, int]) -> None:
         """Seed byte accounting before the adapter accepts operations.
 

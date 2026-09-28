@@ -7,14 +7,15 @@ recurrent state. Writing each one through to L2 wears flash storage with
 states that the next turn of the same conversation supersedes within
 seconds, and pushes still-useful checkpoints out of L2 by capacity.
 
-This policy keeps new checkpoint pages in L1 only. When L1 is about to evict
-a page that is still current (not superseded by a newer checkpoint of the
-same conversation) and not yet in L2, the page is written to L2 first and
-evicted after the write completes. A conversation that stays active never
-writes its checkpoints; one that goes idle writes its latest checkpoint once.
-Superseded pages are evicted without a write. Ordinary KV chunks keep
-write-through behavior. On a clean shutdown, current checkpoint pages still
-in L1 are written to L2 within the configured time budget.
+This policy keeps new checkpoint pages in L1 until memory pressure or shutdown.
+Retained pages without an L2 copy are offered for bounded asynchronous
+persistence before normal eviction. Supersession guides victim selection but
+does not prove an older branch is dead. Sustained capacity pressure may retire
+cold checkpoints coherently before reclaiming their last pages.
+
+Ordinary KV chunks keep write-through behavior. Clean shutdown persists retained
+pages within its time budget; unfinished checkpoints may be lost. Write savings
+depend on retirement before persistence, not merely conversation activity.
 
 Select it with ``--l2-store-policy checkpoint_on_evict``.
 """

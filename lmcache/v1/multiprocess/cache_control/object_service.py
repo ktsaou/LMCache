@@ -13,7 +13,7 @@ from typing import Any
 import asyncio
 
 # First Party
-from lmcache.v1.distributed.api import EncodedObjectKey, Tier
+from lmcache.v1.distributed.api import EncodedObjectKey, ObjectKey, Tier
 from lmcache.v1.multiprocess.cache_control.errors import (
     InvalidRequest,
     NotFound,
@@ -150,12 +150,14 @@ class ObjectService:
         L2 deletion is idempotent at the adapter level (absent / locked keys are
         skipped). The L2 adapter is only resolved when the tier includes L2, so a
         pure ``l1`` delete works on an L1-only server.
+        Duplicate keys are processed and counted once per tier.
 
         Returns:
             ``{"deleted", "skipped", "ok"[, "error"]}``: ``deleted`` is the total
-            keys removed across the requested tiers (L1 removals plus the L2 batch
-            size); ``skipped`` is the L1 keys refused because they were locked
-            (non-force only); ``ok`` is ``False`` with ``error`` set when the L2
+            L1 keys removed plus L2 keys submitted after checkpoint protection;
+            adapters may additionally skip busy or absent keys. ``skipped`` counts
+            L1 lock refusals and L2 checkpoint protection refusals.
+            ``ok`` is ``False`` with ``error`` set when the L2
             adapter raised (a structured failure, not a crash).
 
         Raises:
@@ -175,6 +177,7 @@ class ObjectService:
                 parsed.append(cache_key.to_object_key())
             except ValueError as exc:
                 raise InvalidRequest(f"keys[{i}]: {exc}") from None
+        parsed = list(dict.fromkeys(parsed))
 
         deleted = 0
         skipped = 0
@@ -189,10 +192,21 @@ class ObjectService:
             skipped += l1_skipped
 
         if tier in (Tier.L2, Tier.ALL):
-            _, adapter = self._resolve_adapter(adapter_selector)
+            descriptor, adapter = self._resolve_adapter(adapter_selector)
+
+            def delete_selected(selected: list[ObjectKey]) -> int:
+                adapter.delete(selected)
+                return len(selected)
+
             try:
-                await asyncio.to_thread(adapter.delete, parsed)
-                deleted += len(parsed)
+                selected_count = await asyncio.to_thread(
+                    self._engine.storage_manager.checkpoint_retention.evict,
+                    parsed,
+                    descriptor.index,
+                    delete_selected,
+                )
+                deleted += selected_count
+                skipped += len(parsed) - selected_count
             except Exception as exc:  # noqa: BLE001 - structured result, not a crash
                 ok = False
                 error = str(exc)

@@ -209,9 +209,9 @@ class CheckpointModule:
         checkpoints, which other conversations share, are kept. Pages the
         new checkpoint references are current again.
 
-        Superseded pages are evicted first and are never written to L2 on
-        eviction. Their manifests stay listed, so a request that branches
-        from an older turn can still restore one while its pages last.
+        Supersession is an eviction preference, not permission to lose a
+        retained branch. Persist its last copy or retire its manifest before
+        reclaiming pages that no remaining generation needs.
 
         Returns:
             Number of pages newly marked superseded.
@@ -363,7 +363,9 @@ class CheckpointModule:
         This module never frees buffers solely because a copy took too long.
         The owning process shutdown must coordinate GPU worker termination.
         """
-        status = self._payloads.report_status()
-        if status["store_leases"] or status["retrieve_leases"]:
-            raise RuntimeError("Checkpoint worker copy leases must drain before close")
+        self._payloads.quiesce()
         self._index.close()
+
+    def prepare_terminal_shutdown(self) -> None:
+        """Repair persistent metadata while retaining orphaned copy buffers."""
+        self._payloads.prepare_terminal_shutdown()

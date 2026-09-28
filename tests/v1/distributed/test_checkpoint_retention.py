@@ -81,12 +81,12 @@ def test_ordinary_kv_chunks_are_never_held_or_tracked():
     assert not retention.is_l2_resident(key)
 
 
-def test_superseded_page_is_evictable_without_a_write():
+def test_superseded_page_still_needs_persistence():
     retention = CheckpointRetention(write_on_evict=True)
     old, shared = make_key(1), make_key(2)
     assert retention.mark_superseded("gen-old", [old, shared]) == 2
     assert retention.is_superseded_generation("gen-old")
-    assert not retention.needs_persist_before_evict(old)
+    assert retention.needs_persist_before_evict(old)
     # A newer checkpoint references the shared page again.
     retention.mark_current([shared])
     assert not retention.is_superseded(shared)
@@ -95,7 +95,7 @@ def test_superseded_page_is_evictable_without_a_write():
     assert retention.mark_superseded("gen-old-2", [old]) == 0
 
 
-def test_timed_out_write_allows_eviction():
+def test_write_age_alone_does_not_allow_last_copy_eviction():
     retention = CheckpointRetention(write_on_evict=True, persist_timeout=5.0)
     key = make_key(1)
     with patch("time.monotonic", return_value=100.0):
@@ -103,9 +103,9 @@ def test_timed_out_write_allows_eviction():
     with patch("time.monotonic", return_value=104.0):
         assert retention.needs_persist_before_evict(key)
     with patch("time.monotonic", return_value=106.0):
-        assert not retention.needs_persist_before_evict(key)
-    assert retention.report_status()["write_on_evict_timeouts"] == 1
-    assert retention.pending_count() == 0
+        assert retention.needs_persist_before_evict(key)
+    assert retention.report_status()["write_on_evict_timeouts"] == 0
+    assert retention.pending_count() == 1
 
 
 def test_superseded_in_adapter_respects_residency_and_budget():
@@ -139,7 +139,8 @@ def test_bounds_forget_oldest_entries():
     retention.mark_superseded("gen", keys)
     assert retention.superseded_keys() == keys[1:]
     retention.record_l2_present(0, keys, [1, 1, 1])
-    assert not retention.is_l2_resident(keys[0])
+    # Supersession hints are bounded; replica presence cannot silently expire.
+    assert retention.is_l2_resident(keys[0])
     assert retention.is_l2_resident(keys[2])
 
 

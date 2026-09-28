@@ -165,7 +165,10 @@ class MPCacheServer:
         return status
 
     def close(self) -> None:
-        """Close all modules and release shared resources."""
+        """Terminal shutdown: flush metadata before refusing unsafe buffer release."""
+        for module in self._modules:
+            if isinstance(module, CheckpointModule):
+                module.prepare_terminal_shutdown()
         for module in self._modules:
             module.close()
         self._context.close()

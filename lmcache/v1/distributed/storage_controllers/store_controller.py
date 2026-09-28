@@ -11,14 +11,17 @@ The controller runs a background thread with an event-driven loop that:
 
 # Standard
 from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 import enum
 import select
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import ObjectKey, is_recurrent_checkpoint_key
+from lmcache.v1.distributed.checkpoint_retention import CheckpointRetention
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerListener, L2AdapterListener
 from lmcache.v1.distributed.l1_manager import L1Manager
@@ -88,13 +91,121 @@ class StoreListener(L1ManagerListener, L2AdapterListener):
     so the controller stores a reused key once rather than on every reuse.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        budget_bytes: int = 0,
+        select_new: Callable[[list[ObjectKey]], set[ObjectKey]] | None = None,
+    ) -> None:
         self._pending_keys: list[ObjectKey] = []
         self._reused_keys: list[ObjectKey] = []
         self._residency_events: list[tuple[L2Residency, list[ObjectKey]]] = []
         self._tracks_l2_residency = False
         self._lock = threading.Lock()
         self._event_fd = create_event_notifier()
+        self._budget_bytes = budget_bytes
+        self._select_new = select_new
+        self._owned: dict[ObjectKey, tuple[int, bool]] = {}
+        self._owned_bytes = 0
+        self._rejected = 0
+        self._active: set[ObjectKey] = set()
+
+    def on_l1_committed_objects(
+        self, keys: list[ObjectKey], sizes: list[int]
+    ) -> list[ObjectKey]:
+        if self._select_new is None:
+            self.on_l1_keys_write_finished(keys)
+            return []
+        selected = self._select_new(keys)
+        pairs = [
+            (key, size)
+            for key, size in zip(keys, sizes, strict=True)
+            if key in selected
+        ]
+        return self.claim(
+            [key for key, _ in pairs], [size for _, size in pairs], reuse=False
+        )
+
+    def claim(
+        self, keys: list[ObjectKey], sizes: list[int], *, reuse: bool = True
+    ) -> list[ObjectKey]:
+        """Accept a byte-bounded batch during L1's atomic ownership handoff."""
+        accepted = []
+        with self._lock:
+            for key, size in zip(keys, sizes, strict=True):
+                if key in self._owned:
+                    continue
+                if self._owned_bytes + size > self._budget_bytes:
+                    self._rejected += 1
+                    continue
+                self._owned[key] = (size, reuse)
+                self._owned_bytes += size
+                accepted.append(key)
+            (self._reused_keys if reuse else self._pending_keys).extend(accepted)
+        if accepted:
+            self._event_fd.notify()
+        return accepted
+
+    def release_owned(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Forget completed/cancelled queue ownership; caller releases L1 pins."""
+        released = []
+        with self._lock:
+            for key in keys:
+                item = self._owned.pop(key, None)
+                if item is not None:
+                    self._owned_bytes -= item[0]
+                    released.append(key)
+        return released
+
+    def ownership(self) -> dict[ObjectKey, tuple[int, bool]]:
+        """Snapshot of bounded work, including its unique source byte sizes."""
+        with self._lock:
+            return dict(self._owned)
+
+    def owns(self, key: ObjectKey) -> bool:
+        """Return whether queued or active work owns this source page."""
+        with self._lock:
+            return key in self._owned
+
+    def queued(self, key: ObjectKey) -> bool:
+        """Whether ownership can still be cancelled before backend submission."""
+        with self._lock:
+            return key in self._owned and key not in self._active
+
+    def begin_submission(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Atomically claim queued pages against cancellation."""
+        with self._lock:
+            claimed = [
+                key
+                for key in dict.fromkeys(keys)
+                if key in self._owned and key not in self._active
+            ]
+            self._active.update(claimed)
+            return claimed
+
+    def end_submission(self, keys: list[ObjectKey]) -> None:
+        """Return drained pages to cancelable queue ownership."""
+        with self._lock:
+            self._active.difference_update(keys)
+
+    def cancel_queued(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Cancel unsubmitted work; caller releases only the returned pins."""
+        with self._lock:
+            cancelled = [
+                key for key in keys if key in self._owned and key not in self._active
+            ]
+            for key in cancelled:
+                size, _ = self._owned.pop(key)
+                self._owned_bytes -= size
+            return cancelled
+
+    def report_ownership(self) -> dict[str, int]:
+        """Return byte admission accounting without copying the work queue."""
+        with self._lock:
+            return {
+                "owned_source_bytes": self._owned_bytes,
+                "rejected_queue_pages": self._rejected,
+            }
 
     def get_event_fd(self) -> int:
         """
@@ -313,6 +424,8 @@ class StoreController(StorageControllerInterface):
         l2_adapters: list[L2AdapterInterface],
         adapter_descriptors: list[AdapterDescriptor],
         policy: StorePolicy,
+        retention: CheckpointRetention | None = None,
+        max_pending_bytes: int | None = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters: dict[int, L2AdapterInterface] = {
@@ -323,6 +436,18 @@ class StoreController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
+        self._retention = retention
+        _, capacity = l1_manager.get_memory_usage()
+        self._max_pending_bytes = (
+            max_pending_bytes
+            if max_pending_bytes is not None
+            else min(capacity, max(4096, capacity // 4))
+        )
+        self._retry: dict[ObjectKey, tuple[float, int]] = {}
+        self._failures: dict[ObjectKey, int] = {}
+        self._completed_destinations: dict[ObjectKey, set[int]] = {}
+        self._destination_attempts: dict[ObjectKey, dict[int, int]] = {}
+        self._accepting = True
 
         # Reuse admission state, touched only by the store loop thread.
         self._tracks_l2_residency = policy.uses_reuse_admission()
@@ -339,7 +464,9 @@ class StoreController(StorageControllerInterface):
         self._pending_adapter_ops: list[AddAdapterOp | RemoveAdapterOp] = []
         self._adapter_ctrl_efd = create_event_notifier()
 
-        self._listener = StoreListener()
+        self._listener = StoreListener(
+            budget_bytes=self._max_pending_bytes, select_new=self._select_new_keys
+        )
         self._l1_manager.register_listener(self._listener)
         if self._tracks_l2_residency:
             self._listener.enable_l2_residency_tracking()
@@ -351,6 +478,7 @@ class StoreController(StorageControllerInterface):
         # Composite key is needed because task IDs are only unique
         # within a single adapter, not across adapters.
         self._in_flight_tasks: dict[tuple[int, L2TaskId], InFlightStoreTask] = {}
+        self._active_keys: Counter[ObjectKey] = Counter()
 
         # Shadow counter for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
@@ -402,15 +530,19 @@ class StoreController(StorageControllerInterface):
         """
         Signal the loop to stop, wait for the thread to join.
 
-        Releases all in-flight read locks on shutdown so that
-        L1 objects are not permanently locked.
+        Queued work releases its ownership; active backend buffers remain
+        pinned until adapters drain and release_stopped_ownership is called.
         """
+        self._accepting = False
         self._stop_flag.set()
         # Wake up the poll loop so it can exit promptly
         self._listener.notify()
         self._thread.join()
-        self._cleanup_in_flight_tasks()
-        self._listener.close()
+        # Active backend operations still own their source buffers. The storage
+        # manager closes/drains adapters before release_stopped_ownership().
+        self._discard_owned(
+            [key for key in self._listener.ownership() if not self._key_in_flight(key)]
+        )
         self._adapter_ctrl_efd.close()
 
     def report_status(self) -> dict:
@@ -426,9 +558,11 @@ class StoreController(StorageControllerInterface):
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
             "num_draining_adapters": num_draining,
+            **self._listener.report_ownership(),
+            "max_pending_bytes": self._max_pending_bytes,
         }
 
-    def submit_reused_keys(self, keys: list[ObjectKey]) -> None:
+    def submit_reused_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
         """
         Report keys that a completed restore read from L1.
 
@@ -440,8 +574,43 @@ class StoreController(StorageControllerInterface):
             keys: Keys whose restore, including the consumer's copy, has
                 completed.
         """
-        if keys:
-            self._listener.enqueue_reused_keys(keys)
+        if keys and self._accepting and self._tracks_l2_residency:
+            return self._l1_manager.handoff_internal_reads(keys, self._listener.claim)
+        return []
+
+    def release_stopped_ownership(self) -> None:
+        """Release pins only after every backend has drained or closed."""
+        self._cleanup_in_flight_tasks()
+        self._discard_owned(list(self._listener.ownership()))
+        self._listener.close()
+
+    def submit_checkpoint_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Queue explicit persistence through the policy's existing write path."""
+        if not self._accepting:
+            return []
+        if self._tracks_l2_residency:
+            return self.submit_reused_keys(keys)
+        return self._l1_manager.handoff_internal_reads(
+            keys,
+            lambda available, sizes: self._listener.claim(
+                available, sizes, reuse=False
+            ),
+        )
+
+    def has_pending_work(self) -> bool:
+        """Whether queued, retrying or active work still owns source pages."""
+        return bool(self._listener.ownership() or self._status_in_flight_count)
+
+    def owns_queued(self, key: ObjectKey) -> bool:
+        """Report cancelable source ownership without releasing active I/O."""
+        return self._listener.queued(key)
+
+    def cancel_queued(self, keys: list[ObjectKey]) -> None:
+        """Cancel retired work atomically against backend submission."""
+        released = self._listener.cancel_queued(keys)
+        if released:
+            self._l1_manager.release_internal_reads(released)
+            self._listener.notify()
 
     def add_adapter(
         self,
@@ -557,6 +726,7 @@ class StoreController(StorageControllerInterface):
         while not self._stop_flag.is_set():
             # First, apply runtime add/remove of the L2 adapters.
             self._apply_pending_adapter_ops(poller)
+            self._retry_ready()
 
             ready = poller.poll(STORE_LOOP_POLL_TIMEOUT_MS)
 
@@ -679,7 +849,10 @@ class StoreController(StorageControllerInterface):
             keys (list[ObjectKey]): Keys that finished writing to L1.
         """
 
-        for group in _group_keys_by_shape(keys).values():
+        owned = self._listener.ownership()
+        for group in _group_keys_by_shape(
+            [key for key in keys if key in owned]
+        ).values():
             self._submit_store_for_single_shape(group)
 
     def _process_reuse_events(self) -> None:
@@ -691,14 +864,33 @@ class StoreController(StorageControllerInterface):
             else:
                 for key in keys:
                     self._l2_resident.pop(key, None)
+        owned = self._listener.ownership()
         fresh = [
             key
             for key in dict.fromkeys(reused)
-            if key not in self._l2_resident and key not in self._reuse_in_flight
+            if (self._retention is not None or key not in self._l2_resident)
+            and key not in self._reuse_in_flight
+            and key in owned
         ]
         for group in _group_keys_by_shape(fresh).values():
             plan = self._policy.select_reuse_targets(group, self._routing_descriptors())
-            self._reuse_in_flight.update(self._submit_plan(plan))
+            submitted = set(self._submit_plan(plan))
+            self._reuse_in_flight.update(submitted)
+            self._discard_owned(
+                [
+                    key
+                    for key in group
+                    if key not in submitted and key not in self._retry
+                ]
+            )
+        fresh_keys = set(fresh)
+        self._discard_owned(
+            [
+                key
+                for key in reused
+                if key not in fresh_keys and not self._key_in_flight(key)
+            ]
+        )
 
     def _routing_descriptors(self) -> list[AdapterDescriptor]:
         """Return descriptors of live adapters that may receive new stores."""
@@ -713,14 +905,48 @@ class StoreController(StorageControllerInterface):
     def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
         """Submit ``keys`` (all same shape) to their target adapters."""
         plan = self._policy.select_store_targets(keys, self._routing_descriptors())
-        self._submit_plan(plan)
+        submitted = set(self._submit_plan(plan))
+        self._discard_owned(
+            [key for key in keys if key not in submitted and key not in self._retry]
+        )
 
     def _submit_plan(self, plan: dict[int, list[ObjectKey]]) -> list[ObjectKey]:
         """Submit one store task per adapter in ``plan``; return submitted keys."""
         l1_mgr = self._l1_manager
         submitted: list[ObjectKey] = []
+        plan = {adapter: list(dict.fromkeys(keys)) for adapter, keys in plan.items()}
+
+        # Fairness is per page: a failing first adapter must not starve a
+        # healthy replica when active destination bytes are serialized.
+        choices: dict[ObjectKey, int] = {}
+        for adapter_index, keys in plan.items():
+            for key in keys:
+                if adapter_index in self._completed_destinations.get(key, ()):
+                    continue
+                if (
+                    self._retention is not None
+                    and adapter_index in self._retention.resident_adapters(key)
+                ):
+                    continue
+                attempts = self._destination_attempts.get(key, {})
+                previous = choices.get(key)
+                if previous is None or attempts.get(adapter_index, 0) < attempts.get(
+                    previous, 0
+                ):
+                    choices[key] = adapter_index
 
         for adapter_index, target_keys in plan.items():
+            if not target_keys:
+                continue
+            deferred = [
+                key
+                for key in target_keys
+                if key in choices and choices[key] != adapter_index
+            ]
+            self._schedule_retry(deferred)
+            target_keys = [
+                key for key in target_keys if choices.get(key) == adapter_index
+            ]
             if not target_keys:
                 continue
 
@@ -733,7 +959,28 @@ class StoreController(StorageControllerInterface):
                 continue
 
             # Reserve read to get MemoryObj references and hold read locks
-            read_results = l1_mgr.reserve_read(target_keys)
+            if self._retention is not None:
+                target_keys = [
+                    key
+                    for key in target_keys
+                    if adapter_index not in self._retention.resident_adapters(key)
+                ]
+            target_keys = [
+                key
+                for key in target_keys
+                if adapter_index not in self._completed_destinations.get(key, ())
+            ]
+            if not target_keys:
+                continue
+            # One destination at a time keeps active I/O bytes within the
+            # same source-byte budget even with multiple replication targets.
+            active = [key for key in target_keys if self._key_in_flight(key)]
+            self._schedule_retry(active)
+            target_keys = [key for key in target_keys if not self._key_in_flight(key)]
+            if not target_keys:
+                continue
+            target_keys = self._listener.begin_submission(target_keys)
+            read_results = l1_mgr.reserve_read(target_keys, internal=True)
 
             successful_keys = []
             successful_objs = []
@@ -786,10 +1033,25 @@ class StoreController(StorageControllerInterface):
                 )
 
             if not successful_keys:
+                self._listener.end_submission(target_keys)
                 continue
 
+            self._listener.end_submission(list(set(target_keys) - set(successful_keys)))
+
             adapter = self._l2_adapters[adapter_index]
-            task_id = adapter.submit_store_task(successful_keys, successful_objs)
+            for key in successful_keys:
+                attempts = self._destination_attempts.setdefault(key, {})
+                attempts[adapter_index] = attempts.get(adapter_index, 0) + 1
+            try:
+                task_id = adapter.submit_store_task(successful_keys, successful_objs)
+            except Exception:
+                l1_mgr.release_internal_reads(successful_keys)
+                self._listener.end_submission(successful_keys)
+                self._schedule_retry(successful_keys)
+                logger.exception(
+                    "L2 store submission failed for adapter %d", adapter_index
+                )
+                continue
             submitted.extend(successful_keys)
 
             self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
@@ -798,6 +1060,7 @@ class StoreController(StorageControllerInterface):
                 read_locked_keys=list(successful_keys),
             )
             self._status_in_flight_count += 1
+            self._active_keys.update(successful_keys)
 
             # All objects for a single store task share one layout (L1
             # allocates uniform MemoryObjs per chunk), so total bytes is
@@ -868,9 +1131,14 @@ class StoreController(StorageControllerInterface):
         l1_mgr = self._l1_manager
         success = task.l2_store_result
 
-        l1_mgr.finish_read(task.read_locked_keys)
+        l1_mgr.release_internal_reads(task.read_locked_keys)
+        self._listener.end_submission(task.read_locked_keys)
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
+        for key in task.keys:
+            self._active_keys[key] -= 1
+            if self._active_keys[key] == 0:
+                del self._active_keys[key]
         self._reuse_in_flight.difference_update(task.keys)
 
         l2_name = self._adapter_descriptors[adapter_index].type_name
@@ -880,7 +1148,15 @@ class StoreController(StorageControllerInterface):
             "l2_name": l2_name,
             "bytes_transferred": task.l2_bytes_transferred,
         }
+        delete_keys = []
         if success:
+            for key in task.keys:
+                # Checkpoint replicas have exact deletion-aware accounting.
+                # Ordinary chunks only need progress across this bounded batch.
+                if self._retention is None or not is_recurrent_checkpoint_key(key):
+                    self._completed_destinations.setdefault(key, set()).add(
+                        adapter_index
+                    )
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_STORE_COMPLETED,
@@ -898,11 +1174,9 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(task.keys),
             )
-            if self._tracks_l2_residency:
+            if self._tracks_l2_residency and self._retention is None:
                 self._remember_l2_resident(task.keys)
             delete_keys = self._policy.select_l1_deletions(task.keys)
-            if delete_keys:
-                l1_mgr.delete(delete_keys)
         else:
             self._event_bus.publish(
                 Event(
@@ -920,6 +1194,19 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 task.keys,
             )
+            self._schedule_retry(task.keys)
+        self._discard_owned(
+            [
+                key
+                for key in task.keys
+                if not self._key_in_flight(key) and key not in self._retry
+            ]
+        )
+        if delete_keys:
+            if self._retention is not None:
+                self._retention.evict(delete_keys, "l1", l1_mgr.delete)
+            else:
+                l1_mgr.delete(delete_keys)
 
     def _remember_l2_resident(self, keys: list[ObjectKey]) -> None:
         """Record keys as present in L2, forgetting the oldest beyond the bound."""
@@ -942,5 +1229,84 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 len(task.read_locked_keys),
             )
-            l1_mgr.finish_read(task.read_locked_keys)
+            l1_mgr.release_internal_reads(task.read_locked_keys)
+            self._listener.end_submission(task.read_locked_keys)
         self._in_flight_tasks.clear()
+        self._active_keys.clear()
+        self._status_in_flight_count = 0
+
+    def _select_new_keys(self, keys: list[ObjectKey]) -> set[ObjectKey]:
+        if not self._accepting:
+            return set()
+        plan = self._policy.select_store_targets(
+            keys, list(self._adapter_descriptors.values())
+        )
+        return {key for group in plan.values() for key in group}
+
+    def _key_in_flight(self, key: ObjectKey) -> bool:
+        return key in self._active_keys
+
+    def _discard_owned(self, keys: list[ObjectKey]) -> None:
+        released = self._listener.release_owned(keys)
+        if released:
+            self._l1_manager.release_internal_reads(released)
+            if self._retention is not None:
+                self._retention.forget_pending(released)
+        for key in keys:
+            self._retry.pop(key, None)
+            self._failures.pop(key, None)
+            self._completed_destinations.pop(key, None)
+            self._destination_attempts.pop(key, None)
+
+    def _schedule_retry(self, keys: list[ObjectKey]) -> None:
+        owned = self._listener.ownership()
+        for key in keys:
+            if key not in owned:
+                continue
+            attempt = self._failures.get(key, 0) + 1
+            self._failures[key] = attempt
+            self._retry[key] = (
+                time.monotonic() + min(5.0, 0.1 * 2 ** min(attempt, 6)),
+                attempt,
+            )
+
+    def _retry_ready(self) -> None:
+        owned = self._listener.ownership()
+        for key in list(self._retry):
+            if key not in owned:
+                self._discard_owned([key])
+        cancelled = [
+            key
+            for key in owned
+            if is_recurrent_checkpoint_key(key)
+            and self._retention is not None
+            and not self._retention.is_retained(key)
+            and not self._key_in_flight(key)
+        ]
+        self._discard_owned(cancelled)
+        now = time.monotonic()
+        ready = [
+            key
+            for key, (when, _) in self._retry.items()
+            if when <= now and not self._key_in_flight(key)
+        ]
+        for key in ready:
+            self._retry.pop(key, None)
+        for group in _group_keys_by_shape(ready).values():
+            reuse = [key for key in group if owned.get(key, (0, False))[1]]
+            reuse_keys = set(reuse)
+            new = [key for key in group if key not in reuse_keys]
+            plans = [
+                self._policy.select_reuse_targets(reuse, self._routing_descriptors()),
+                self._policy.select_store_targets(new, self._routing_descriptors()),
+            ]
+            submitted = set()
+            for plan in plans:
+                submitted.update(self._submit_plan(plan))
+            self._discard_owned(
+                [
+                    key
+                    for key in group
+                    if key not in submitted and key not in self._retry
+                ]
+            )

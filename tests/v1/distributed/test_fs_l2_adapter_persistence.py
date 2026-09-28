@@ -5,7 +5,9 @@
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
+import asyncio
 import os
+import threading
 import time
 
 # Third Party
@@ -37,6 +39,91 @@ class _Buffer:
 
 def _memory_obj(data: bytes) -> MemoryObj:
     return cast(MemoryObj, _Buffer(data))
+
+
+def test_close_waits_for_running_executor_io(tmp_path: Path) -> None:
+    """Coroutine cancellation cannot release memory still read by a syscall."""
+    adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+    def blocked_write(path: Path, data: memoryview) -> bool:
+        entered.set()
+        assert release.wait(5)
+        path.write_bytes(data)
+        return True
+
+    def close() -> None:
+        adapter.close()
+        closed.set()
+
+    # Force the actual executor-backed O_DIRECT dispatch without host O_DIRECT.
+    with (
+        patch.object(adapter, "_use_odirect", True),
+        patch.object(adapter, "_os_disk_bs", 4096),
+        patch.object(adapter, "_write_with_odirect", blocked_write),
+    ):
+        adapter.submit_store_task([_long_key()], [_memory_obj(bytes(4096))])
+        assert entered.wait(5)
+        closer = threading.Thread(target=close)
+        closer.start()
+        try:
+            assert not closed.wait(0.2)
+        finally:
+            release.set()
+            closer.join(5)
+        assert closed.is_set()
+
+
+def test_close_keeps_delete_pending_until_unlink_drains(tmp_path: Path) -> None:
+    adapter = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    key = _long_key()
+    _wait_for_store(adapter, key, b"retained payload")
+    entered, release = threading.Event(), threading.Event()
+    deleted, closed = threading.Event(), threading.Event()
+    errors: list[Exception] = []
+
+    def unlink(path: Path) -> None:
+        entered.set()
+        assert release.wait(10)
+        os.unlink(path)
+
+    async def delayed_unlink(path: Path) -> None:
+        await asyncio.to_thread(unlink, path)
+
+    def delete() -> None:
+        try:
+            adapter.delete([key])
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            deleted.set()
+
+    def close() -> None:
+        adapter.close()
+        closed.set()
+
+    # Hold the real executor syscall so cancellation cannot mimic completion.
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.fs_l2_adapter.aiofiles.os.unlink",
+        delayed_unlink,
+    ):
+        deletion = threading.Thread(target=delete)
+        closer = threading.Thread(target=close)
+        deletion.start()
+        try:
+            assert entered.wait(5)
+            closer.start()
+            assert not deleted.wait(0.2)
+            assert not closed.is_set()
+        finally:
+            release.set()
+            deletion.join(5)
+            if closer.ident is not None:
+                closer.join(5)
+    assert deleted.is_set() and closed.is_set()
+    assert not errors
+    assert key not in adapter.get_existing_key_sizes()
+    adapter.close()
 
 
 def _long_key(*, model_suffix: str = "", salt_suffix: str = "") -> ObjectKey:

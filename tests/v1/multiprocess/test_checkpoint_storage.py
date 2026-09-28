@@ -84,22 +84,29 @@ def open_store(
     shutdown_flush_seconds: float = 30.0,
     admission_timeout_seconds: float = 8.0,
     prefetch_policy: str = "default",
+    lock_ttl_seconds: int = 300,
+    disk_capacity_gb: float = 0,
 ) -> Iterator[tuple[CheckpointPayloadStore, CheckpointIndex, StorageManager, mmap]]:
     name = shm_name or f"lmcache_l1_pool_checkpoint_test_{uuid.uuid4().hex}"
     size = 4 * 1024 * 1024
+    adapters = []
+    if path is not None:
+        adapter = (FSNativeL2AdapterConfig if native else FSL2AdapterConfig)(
+            str(path / "payloads"),
+            **({"max_capacity_gb": disk_capacity_gb} if native else {}),
+        )
+        if disk_capacity_gb:
+            adapter.eviction_config = EvictionConfig(eviction_policy="LRU")
+        adapters.append(adapter)
     storage = StorageManager(
         StorageManagerConfig(
-            L1ManagerConfig(L1MemoryManagerConfig(size, False, shm_name=name)),
-            EvictionConfig(eviction_policy="LRU"),
-            l2_adapter_config=L2AdaptersConfig(
-                [
-                    (FSNativeL2AdapterConfig if native else FSL2AdapterConfig)(
-                        str(path / "payloads")
-                    )
-                ]
-                if path is not None
-                else []
+            L1ManagerConfig(
+                L1MemoryManagerConfig(size, False, shm_name=name),
+                read_ttl_seconds=lock_ttl_seconds,
+                write_ttl_seconds=lock_ttl_seconds,
             ),
+            EvictionConfig(eviction_policy="LRU"),
+            l2_adapter_config=L2AdaptersConfig(adapters),
             store_policy=store_policy,
             prefetch_policy=prefetch_policy,
             checkpoint_shutdown_flush_seconds=shutdown_flush_seconds,
@@ -692,7 +699,7 @@ def test_failed_storage_commit_releases_uncommitted_write_reservations(
         raise RuntimeError("injected storage commit failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(storage, "finish_write", fail_commit)
+        patch.setattr(storage, "finish_write_pinned", fail_commit)
         with pytest.raises(RuntimeError, match="injected storage commit failure"):
             service.finish_store(lease.lease_id, True)
     assert index.find((entry.prefix,)) is None
@@ -785,7 +792,8 @@ def test_payload_capacity_miss_preserves_a_pinned_checkpoint(store: Any) -> None
 def fill(mapping: mmap, lease: CheckpointSlots, rank: int) -> None:
     for group_id, group in enumerate(lease.groups):
         for page_id, slot in enumerate(group):
-            assert slot is not None
+            if slot is None:
+                continue
             mapping[slot.offset : slot.offset + slot.length] = (
                 bytes([rank * 16 + group_id * 4 + page_id]) * slot.length
             )
@@ -881,6 +889,8 @@ def test_http_nonforced_clear_preserves_checkpoint_read_and_write_leases(
             key for group in checkpoint_object_keys(pending, 0) for key in group
         ]
         assert storage.get_readable_keys(committed) == committed
+        # A completed rank still owns its pages until its peers publish or abort.
+        index.abort(pending.generation)
         response = client.post("/cache/clear", json={"force": False})
         assert response.status_code == 200
         assert storage.get_readable_keys(retained + committed) == []
@@ -1180,6 +1190,7 @@ def drain_l2_stores(storage: StorageManager) -> None:
             == status["pending_reused_keys_count"]
             == status["in_flight_task_count"]
             == 0
+            and status.get("owned_source_bytes", 0) == 0
         ):
             return
         time.sleep(0.01)
@@ -1233,7 +1244,7 @@ def test_reuse_admission_persists_only_restored_checkpoints(
                     )
             service.finish_retrieve(lease.lease_id)
         # Never restored before the restart, so its pages never reached L2.
-        assert index.find((unused.prefix,)) == unused
+        assert index.find((unused.prefix,)) is None
         lease_id = service.begin_retrieve(unused, 0)
         assert lease_id is not None
         assert poll(service, lease_id) is False
@@ -1337,10 +1348,10 @@ def test_evict_admission_writes_checkpoint_only_when_l1_evicts_it(
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_superseded_checkpoint_is_dropped_first_and_never_written(
+def test_superseded_checkpoint_is_persisted_before_ordinary_eviction(
     tmp_path: Path, native: bool
 ) -> None:
-    """An older turn's unique pages leave L1 first and never reach L2."""
+    """Supersession prioritizes eviction without destroying a retained branch."""
     older, newer = large_manifest(200), large_manifest(201)
     with open_store(
         tmp_path, native, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
@@ -1356,7 +1367,7 @@ def test_superseded_checkpoint_is_dropped_first_and_never_written(
             "current checkpoint pages never reached L2",
         )
         drain_l2_stores(storage)
-        assert not any(retention.is_l2_resident(key) for key in entry_keys(older))
+        assert all(retention.is_l2_resident(key) for key in entry_keys(older))
         assert retention.report_status()["l1_superseded_drops"] >= len(
             entry_keys(older)
         )
@@ -1364,7 +1375,7 @@ def test_superseded_checkpoint_is_dropped_first_and_never_written(
         tmp_path, native, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
     ) as (service, index, storage, mapping):
         assert restores(service, mapping, newer)
-        assert not restores(service, mapping, older)
+        assert restores(service, mapping, older)
 
 
 @pytest.mark.parametrize("flush_seconds", [0.0, 30.0])
@@ -1389,7 +1400,7 @@ def test_shutdown_flush_writes_current_checkpoints_for_the_next_start(
         tmp_path, True, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
     ) as (service, index, storage, mapping):
         assert restores(service, mapping, current) == (flush_seconds > 0)
-        assert not restores(service, mapping, superseded)
+        assert restores(service, mapping, superseded) == (flush_seconds > 0)
 
 
 def publish_before_restart(

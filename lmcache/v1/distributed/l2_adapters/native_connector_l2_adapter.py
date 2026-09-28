@@ -136,6 +136,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
         existing_key_sizes = dict(initial_key_sizes or {})
+        self._inventory_complete = initial_key_sizes is not None
         self._initialize_usage(existing_key_sizes)
         self._client = native_client
         self._client_fd: int = int(native_client.event_fd())
@@ -170,6 +171,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Pending delete events for synchronous delete() calls
         self._pending_delete_events: dict[L2TaskId, threading.Event] = {}
+        self._delete_errors: dict[L2TaskId, str] = {}
 
         # Synchronous stores use private completions so StoreController cannot
         # consume another thread's result from ``_completed_stores``.
@@ -191,6 +193,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Lock for all shared state above
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closing = False
+        self._closed = False
 
         # Background demux thread
         self._stop = threading.Event()
@@ -200,6 +205,10 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             name="l2-adapter-demux",
         )
         self._demux_thread.start()
+
+    def has_complete_inventory(self) -> bool:
+        """Only connectors supplied with a startup inventory prove absence."""
+        return self._inventory_complete
 
     def get_existing_key_sizes(self) -> Mapping[ObjectKey, int]:
         """Return a detached, immutable native-resident key snapshot."""
@@ -253,6 +262,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         # with demux thread. The native submit is
         # non-blocking so holding the lock is brief.
         with self._lock:
+            if self._closing:
+                raise RuntimeError("native adapter is closing")
             task_id = self._get_next_task_id()
             if not self._try_reserve_store_bytes(reserved_bytes):
                 self._completed_stores[task_id] = L2StoreResult(False, 0)
@@ -325,6 +336,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         }
 
         with self._lock:
+            if self._closing:
+                raise RuntimeError("native adapter is closing")
             task_id = self._get_next_task_id()
             if not self._try_reserve_store_bytes(reserved_bytes):
                 logger.warning(
@@ -384,6 +397,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         key_strings = [_object_key_to_string(k) for k in keys]
 
         with self._lock:
+            if self._closing:
+                raise RuntimeError("native adapter is closing")
             task_id = self._get_next_task_id()
             future_id = int(self._client.submit_batch_exists(key_strings))
             self._pending_ops[future_id] = (
@@ -422,6 +437,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         memviews = [_obj_to_memoryview(obj) for obj in objects]
 
         with self._lock:
+            if self._closing:
+                raise RuntimeError("native adapter is closing")
             task_id = self._get_next_task_id()
             future_id = int(self._client.submit_batch_get(key_strings, memviews))
             self._pending_ops[future_id] = (
@@ -445,7 +462,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         """Delete a batch of keys from the remote backend.
 
         Submits a batch delete to the native connector and blocks
-        until the demux thread signals completion (up to 30s timeout).
+        until the demux thread signals completion. A slow unlink retains its
+        lifecycle fence; a timeout cannot cancel an executing backend operation.
         Fires ``_notify_keys_deleted`` on success so eviction policy
         tracking stays in sync.
 
@@ -459,6 +477,8 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         done_event = threading.Event()
 
         with self._lock:
+            if self._closing:
+                raise RuntimeError("native adapter is closing")
             # A key becomes lookup-locked only when the native EXISTS
             # completion is demultiplexed. Protect pending lookup keys as well,
             # otherwise eviction can delete a key between lookup submission and
@@ -494,20 +514,16 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             self._pending_delete_events[task_id] = done_event
 
         # Block until demux thread signals completion
-        if not done_event.wait(timeout=30.0):
-            with self._lock:
-                self._pending_delete_events.pop(task_id, None)
-                # Note: _pending_ops entry may already be consumed
-                # by the demux thread; pop is safe either way.
-                for fid, entry in list(self._pending_ops.items()):
-                    if entry[1] == task_id:
-                        self._pending_ops.pop(fid, None)
-                        break
+        while not done_event.wait(timeout=30.0):
             logger.warning(
-                "delete() timed out after 30s for %d keys",
+                "delete() still draining for %d keys; retaining deletion fence",
                 len(delete_keys),
             )
-            return
+
+        with self._lock:
+            error = self._delete_errors.pop(task_id, None)
+        if error is not None:
+            raise RuntimeError(error)
 
         # ``_notify_keys_deleted`` is fired by the demux thread (with
         # accurate per-key sizes drawn from ``_key_sizes``) when the
@@ -547,31 +563,47 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
     # ---------------------------------------------------------------
 
     def close(self) -> None:
-        self._stop.set()
-        self._demux_thread.join(timeout=5)
+        """Drain native I/O before settling waiters and releasing buffer owners."""
+        with self._close_lock:
+            if self._closed:
+                return
+            with self._lock:
+                self._closing = True
+            self._stop.set()
+            self._demux_thread.join()
 
-        with self._lock:
-            sync_events = [
-                event for event, _result in self._pending_sync_store_events.values()
-            ]
-            self._pending_sync_store_events.clear()
-            abandoned_stores = list(self._pending_store_sizes.values())
-            self._pending_store_sizes.clear()
-            self._pending_ops.clear()
-        # Keep ``abandoned_stores`` (and therefore every buffer owner) alive
-        # until the native client has stopped its worker threads.
-        self._client.close()
-        abandoned_reservations = sum(
-            pending.reserved_bytes for pending in abandoned_stores
-        )
-        if abandoned_reservations:
-            self._release_store_reservation(abandoned_reservations)
-        for event in sync_events:
-            event.set()
-
-        self._store_efd.close()
-        self._lookup_efd.close()
-        self._load_efd.close()
+            with self._lock:
+                sync_events = [
+                    event for event, _result in self._pending_sync_store_events.values()
+                ]
+                abandoned_stores = list(self._pending_store_sizes.values())
+                pending_deletes = dict(self._pending_delete_events)
+            # Keep buffer owners and deletion fences until every syscall drains.
+            # If native close fails, do not claim that releasing them is safe.
+            self._client.close()
+            with self._lock:
+                self._pending_sync_store_events.clear()
+                self._pending_store_sizes.clear()
+                self._pending_ops.clear()
+                self._pending_delete_events.clear()
+                for task_id in pending_deletes:
+                    self._delete_errors[task_id] = (
+                        "native adapter closed after I/O drain; "
+                        "delete outcome unavailable"
+                    )
+            abandoned_reservations = sum(
+                pending.reserved_bytes for pending in abandoned_stores
+            )
+            if abandoned_reservations:
+                self._release_store_reservation(abandoned_reservations)
+            for event in sync_events:
+                event.set()
+            for event in pending_deletes.values():
+                event.set()
+            self._store_efd.close()
+            self._lookup_efd.close()
+            self._load_efd.close()
+            self._closed = True
 
     # ---------------------------------------------------------------
     # Internal helpers
@@ -617,6 +649,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             sizes_deleted: list[int] = []
             settled_store_reservations = 0
             async_store_completed = False
+            async_store_results: dict[int, L2StoreResult] = {}
             # Events for synchronous ``delete()`` callers. We set these
             # AFTER firing ``_notify_keys_deleted`` below so that when
             # the caller unblocks and calls ``get_usage()``, the base
@@ -689,7 +722,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                                     keys_stored.append(key)
                                     sizes_stored.append(0)
                         if op_type == self._OP_STORE:
-                            self._completed_stores[task_id] = L2StoreResult(
+                            async_store_results[task_id] = L2StoreResult(
                                 completion_ok, task_bytes
                             )
                             async_store_completed = True
@@ -736,6 +769,10 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                         self._load_efd.notify()
 
                     elif op_type == self._OP_DELETE:
+                        if not ok:
+                            self._delete_errors[task_id] = str(
+                                error or "native delete failed"
+                            )
                         if result_bools is not None and lookup_keys is not None:
                             for i, deleted in enumerate(result_bools):
                                 if not deleted:
@@ -758,8 +795,6 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                     keys_stored,
                     sizes_stored,
                 )
-            if async_store_completed:
-                self._store_efd.notify()
             for event in sync_store_done_events:
                 event.set()
 
@@ -772,6 +807,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 self._notify_keys_accessed(keys_accessed)
             if keys_deleted:
                 self._notify_keys_deleted(keys_deleted, sizes_deleted)
+            # Async consumers may release source ownership on completion. Make
+            # replica events visible first, including partial store successes.
+            if async_store_completed:
+                with self._lock:
+                    self._completed_stores.update(async_store_results)
+                self._store_efd.notify()
             # Unblock any synchronous ``delete()`` callers only AFTER
             # ``_notify_keys_deleted`` has updated the base class byte
             # accounting, so ``get_usage()`` never briefly reports stale

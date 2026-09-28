@@ -1,29 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-Decide which recurrent checkpoint pages deserve L1 memory and L2 storage.
+"""Coordinate checkpoint persistence, replica accounting and coherent retirement.
 
-A conversation publishes new request-boundary checkpoints every turn, and
-each one supersedes the previous turn's endpoint state. Pages shared with the
-newer checkpoint stay alive through it, so only the pages unique to the older
-checkpoint (recurrent endpoint state, a partial attention page, auxiliary
-state) become dead weight. This module keeps that knowledge:
+Supersession is an eviction hint, never proof that an older branch is dead.
+Deferred writes start under RAM pressure or shutdown. Directory lifecycle
+callbacks retire affected checkpoints before their final known copy is reclaimed.
 
-* Superseded pages are dropped first from L1 and L2 and are never written to
-  L2 when they leave L1.
-* With write-on-evict storage, a current checkpoint page is written to L2
-  once, when L1 is about to evict it, instead of on every request.
-* L2 residency per adapter is tracked so a page that already reached L2 is
-  not written again.
-
-Everything is bounded in memory and safe to call from the store, eviction and
-request-handler threads. Forgetting an entry only costs an extra write or a
-later eviction; correctness never depends on this state, because restores
-validate every page and fall back to a shorter checkpoint when one is gone.
+Supersession hints are bounded independently. Replica accounting is exact for
+inventoried physical payloads and shrinks when adapters report deletion; it must
+not forget a live replica because a telemetry history limit was reached.
 """
 
 # Standard
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from typing import TypeVar
 import threading
 import time
 
@@ -33,6 +23,7 @@ from lmcache.v1.distributed.api import ObjectKey, is_recurrent_checkpoint_key
 from lmcache.v1.distributed.internal_api import L2AdapterListener
 
 logger = init_logger(__name__)
+_DeleteResult = TypeVar("_DeleteResult")
 
 
 class _BoundedSet:
@@ -89,16 +80,17 @@ class CheckpointRetention:
         persist: Callback that asynchronously stores keys to L2; installed by
             the storage manager once its store controller exists.
         max_superseded: Bound on remembered superseded pages.
-        max_tracked: Bound on remembered L2-resident pages per adapter.
-        persist_timeout: Seconds after which a page whose write never
-            completed may be evicted from L1 without reaching L2.
+        max_tracked: Legacy compatibility argument; physical replica inventory
+            is exact and bounded by stored payloads, not a telemetry history cap.
+        persist_timeout: Legacy compatibility argument. Elapsed write time alone
+            no longer permits losing a retained checkpoint page.
     """
 
     def __init__(
         self,
         *,
         write_on_evict: bool = False,
-        persist: Callable[[list[ObjectKey]], None] | None = None,
+        persist: Callable[[list[ObjectKey]], list[ObjectKey] | None] | None = None,
         max_superseded: int = 262144,
         max_tracked: int = 1048576,
         max_generations: int = 65536,
@@ -106,13 +98,12 @@ class CheckpointRetention:
     ) -> None:
         self._write_on_evict = write_on_evict
         self._persist = persist
-        self._max_tracked = max_tracked
-        self._persist_timeout = persist_timeout
         self._lock = threading.Lock()
         self._superseded = _BoundedSet(max_superseded)
         self._superseded_generations = _BoundedSet(max_generations)
         # adapter id -> key -> size in bytes
         self._resident: dict[int, OrderedDict[ObjectKey, int]] = {}
+        self._unknown_inventories: set[int] = set()
         # key -> monotonic time its write was requested
         self._pending: dict[ObjectKey, float] = {}
         self._stats = {
@@ -124,13 +115,93 @@ class CheckpointRetention:
             "write_on_evict_requests": 0,
             "write_on_evict_persisted": 0,
             "write_on_evict_timeouts": 0,
+            "retired_checkpoints": 0,
         }
+        self._evict: Callable | None = None
+        self._pressure: Callable[[int], int] | None = None
+        self._retained: Callable[[ObjectKey], bool] | None = None
+        self._order: Callable[[list[ObjectKey]], list[ObjectKey]] | None = None
+        self._reconcile: Callable[[], None] | None = None
+
+    def set_lifecycle(
+        self,
+        *,
+        evict: Callable | None,
+        pressure: Callable[[int], int] | None,
+        retained: Callable[[ObjectKey], bool] | None,
+        order: Callable[[list[ObjectKey]], list[ObjectKey]] | None = None,
+        reconcile: Callable[[], None] | None = None,
+    ) -> None:
+        """Attach the directory authority; callbacks run outside retention locks."""
+        self._evict, self._pressure, self._retained = evict, pressure, retained
+        self._order = order
+        self._reconcile = reconcile
+
+    def evict(
+        self,
+        keys: list[ObjectKey],
+        tier: str | int,
+        delete: Callable[[list[ObjectKey]], _DeleteResult],
+    ) -> _DeleteResult:
+        """Retire last-copy owners before deletion; return the callback result.
+
+        ``tier`` identifies L1 or an adapter. The callback receives only keys
+        eligible for deletion, and its exceptions propagate to the caller.
+        """
+        if self._evict is not None:
+            return self._evict(keys, tier, delete)
+        return delete(keys)
+
+    def retire_under_pressure(self, target_bytes: int) -> int:
+        """Retire cold generations to free capacity after bounded admission waits."""
+        return self._pressure(target_bytes) if self._pressure is not None else 0
+
+    def is_retained(self, key: ObjectKey) -> bool:
+        """Whether a checkpoint page still has a generation owner."""
+        return self._retained(key) if self._retained is not None else True
+
+    def resident_adapters(
+        self, key: ObjectKey, expected_size: int | None = None
+    ) -> set[int]:
+        """Return known replicas, optionally requiring the manifest's byte size.
+
+        Args:
+            key: Checkpoint page to inspect.
+            expected_size: Required payload bytes, or None for presence only.
+
+        Returns:
+            Adapter IDs with a matching recorded replica.
+        """
+        with self._lock:
+            return {
+                adapter
+                for adapter, resident in self._resident.items()
+                if key in resident
+                and (expected_size is None or resident[key] == expected_size)
+            }
+
+    def record_retirement(self, count: int) -> None:
+        """Count explicitly retired generations separately from failed restores."""
+        with self._lock:
+            self._stats["retired_checkpoints"] += count
+
+    def set_inventory_complete(self, adapter_id: int) -> None:
+        """Mark a successfully enumerated adapter inventory as authoritative."""
+        with self._lock:
+            self._unknown_inventories.discard(adapter_id)
+
+    def inventories_complete(self) -> bool:
+        """Whether missing residency is proof of absence across all adapters."""
+        with self._lock:
+            return not self._unknown_inventories
 
     @property
     def write_on_evict(self) -> bool:
         return self._write_on_evict
 
-    def set_persist(self, persist: Callable[[list[ObjectKey]], None]) -> None:
+    def set_persist(
+        self, persist: Callable[[list[ObjectKey]], list[ObjectKey] | None]
+    ) -> None:
         """Install the asynchronous L2 store callback."""
         self._persist = persist
 
@@ -138,11 +209,22 @@ class CheckpointRetention:
         """Return a listener that records one adapter's checkpoint pages."""
         with self._lock:
             self._resident.setdefault(adapter_id, OrderedDict())
+            self._unknown_inventories.add(adapter_id)
         return _AdapterResidencyListener(self, adapter_id)
 
     def forget_adapter(self, adapter_id: int) -> None:
         with self._lock:
+            keys = list(self._resident.get(adapter_id, {}))
+        self.evict(
+            keys,
+            adapter_id,
+            lambda selected: self.record_l2_absent(adapter_id, selected),
+        )
+        with self._lock:
             self._resident.pop(adapter_id, None)
+            self._unknown_inventories.discard(adapter_id)
+        if self._reconcile is not None:
+            self._reconcile()
 
     # ----- supersession ---------------------------------------------------
 
@@ -196,12 +278,13 @@ class CheckpointRetention:
             for key, size in zip(keys, sizes, strict=False):
                 if not is_recurrent_checkpoint_key(key):
                     continue
-                resident[key] = size
+                if size or key not in resident:
+                    resident[key] = size
                 resident.move_to_end(key)
                 if self._pending.pop(key, None) is not None:
                     self._stats["write_on_evict_persisted"] += 1
-            while len(resident) > self._max_tracked:
-                resident.popitem(last=False)
+            # Residency is bounded by physical tier contents, not an LRU sample.
+            # Forgetting a live replica would make retirement decisions unsound.
 
     def record_l2_absent(self, adapter_id: int, keys: list[ObjectKey]) -> None:
         with self._lock:
@@ -211,9 +294,32 @@ class CheckpointRetention:
             for key in keys:
                 resident.pop(key, None)
 
-    def is_l2_resident(self, key: ObjectKey) -> bool:
+    def is_l2_resident(self, key: ObjectKey, expected_size: int | None = None) -> bool:
+        """Whether a replica exists with the optional required payload byte size."""
         with self._lock:
-            return any(key in resident for resident in self._resident.values())
+            return any(
+                key in resident
+                and (expected_size is None or resident[key] == expected_size)
+                for resident in self._resident.values()
+            )
+
+    def replica_may_match(
+        self, adapter_id: int, key: ObjectKey, expected_size: int
+    ) -> bool:
+        """Allow lookup unless inventory positively proves a byte-size mismatch.
+
+        Args:
+            adapter_id: Backend being considered for the load.
+            key: Requested object key.
+            expected_size: Required logical payload bytes.
+
+        Returns:
+            True for unknown or matching sizes; False for a known mismatch.
+        """
+        with self._lock:
+            resident = self._resident.get(adapter_id)
+            size = resident.get(key) if resident is not None else None
+            return size is None or size == expected_size
 
     def superseded_in_adapter(
         self, adapter_id: int, max_bytes: int
@@ -247,42 +353,52 @@ class CheckpointRetention:
     def needs_persist_before_evict(self, key: ObjectKey) -> bool:
         """Whether L1 must keep ``key`` until its L2 write completes.
 
-        True for a current checkpoint page that is not in L2 yet, while its
-        write is still expected to finish. A superseded page, an ordinary KV
-        chunk or a page whose write timed out may be evicted.
+        True for a checkpoint page without a known L2 copy. Ordinary KV
+        chunks follow their existing policy. Capacity-driven loss first retires
+        the owning generations; age and supersession alone never allow loss.
         """
         if not self._write_on_evict or not is_recurrent_checkpoint_key(key):
             return False
-        now = time.monotonic()
         with self._lock:
-            if key in self._superseded:
-                return False
             if any(key in resident for resident in self._resident.values()):
                 self._pending.pop(key, None)
-                return False
-            requested = self._pending.get(key)
-            if requested is not None and now - requested > self._persist_timeout:
-                del self._pending[key]
-                self._stats["write_on_evict_timeouts"] += 1
-                logger.warning(
-                    "Checkpoint page write to L2 did not complete within %.0f s; "
-                    "evicting it from L1 without an L2 copy",
-                    self._persist_timeout,
-                )
                 return False
             return True
 
     def request_persist(self, keys: list[ObjectKey]) -> int:
         """Ask the store controller to write pages not already requested."""
+        if self._order is not None:
+            keys = self._order(keys)
         now = time.monotonic()
         with self._lock:
-            fresh = [key for key in keys if key not in self._pending]
+            fresh = [
+                key
+                for key in keys
+                if key not in self._pending
+                and not any(key in resident for resident in self._resident.values())
+            ]
             for key in fresh:
                 self._pending[key] = now
             self._stats["write_on_evict_requests"] += len(fresh)
         if fresh and self._persist is not None:
-            self._persist(fresh)
-        return len(fresh)
+            accepted = self._persist(fresh)
+            if accepted is not None:
+                accepted_keys = set(accepted)
+                with self._lock:
+                    for key in fresh:
+                        if key not in accepted_keys:
+                            self._pending.pop(key, None)
+        return (
+            len(accepted_keys)
+            if fresh and self._persist is not None and accepted is not None
+            else len(fresh)
+        )
+
+    def forget_pending(self, keys: Iterable[ObjectKey]) -> None:
+        """Forget requests for pages no retained generation needs."""
+        with self._lock:
+            for key in keys:
+                self._pending.pop(key, None)
 
     def pending_count(self) -> int:
         with self._lock:

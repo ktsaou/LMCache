@@ -56,6 +56,9 @@ from lmcache.v1.distributed.storage_controllers import (
     PrefetchController,
     StoreController,
 )
+from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+    PrefetchResult,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
 )
@@ -118,6 +121,7 @@ class StorageManager:
         self._checkpoint_shutdown_flush_seconds = (
             config.checkpoint_shutdown_flush_seconds
         )
+        self._checkpoint_shutdown_flushed = False
         self._checkpoint_retention = CheckpointRetention(
             write_on_evict=store_policy.writes_checkpoints_on_evict(),
             persist_timeout=config.checkpoint_write_timeout_seconds,
@@ -129,6 +133,9 @@ class StorageManager:
             eviction_config=config.eviction_config,
         )
         self._eviction_controller.set_checkpoint_retention(self._checkpoint_retention)
+        self._eviction_controller.set_pressure_grace(
+            self._store_admission_timeout_seconds / 4
+        )
         self._eviction_controller.start()
 
         # L2 adapters and store controller. When an adapter config carries
@@ -200,10 +207,11 @@ class StorageManager:
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=store_policy,
+            retention=self._checkpoint_retention,
         )
         self._store_controller.start()
         self._checkpoint_retention.set_persist(
-            self._store_controller.submit_reused_keys
+            self._store_controller.submit_checkpoint_keys
         )
 
         # Prefetch controller
@@ -213,6 +221,7 @@ class StorageManager:
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
+            replica_may_match=self._checkpoint_retention.replica_may_match,
         )
         self._prefetch_controller.start()
 
@@ -274,6 +283,8 @@ class StorageManager:
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
         mode: Literal["new", "update", "all"],
+        *,
+        internal: bool = False,
     ) -> dict[ObjectKey, tuple[L1Error, MemoryObj | None]]:
         """Reserve objects while preserving each L1 failure reason.
 
@@ -294,6 +305,7 @@ class StorageManager:
             is_temporary=[False] * len(keys),
             layout_desc=layout_desc,
             mode=mode,
+            internal=internal,
         )
 
         result = {k: m for k, (e, m) in reserve_result.items() if m is not None}
@@ -337,13 +349,77 @@ class StorageManager:
             if memory_obj is not None
         }
 
-    def get_readable_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
-        """Return complete readable keys without retaining their read locks."""
-        results = self._l1_manager.reserve_read(keys)
-        readable = [key for key, (_error, obj) in results.items() if obj is not None]
-        if readable:
-            self._l1_manager.finish_read(readable)
-        return readable
+    def get_readable_keys(
+        self, keys: list[ObjectKey], *, retained_only: bool = False
+    ) -> list[ObjectKey]:
+        """Snapshot readable keys; optionally exclude automatically freed pages."""
+        return self._l1_manager.readable_keys(keys, retained_only=retained_only)
+
+    def pin_readable_keys(
+        self, keys: list[ObjectKey], *, retained_only: bool = False
+    ) -> list[ObjectKey]:
+        """Acquire ownership of existing pages; return the keys actually pinned.
+
+        Release these ownership pins with release_read_pins, not the restore
+        completion API: publication ownership is not consumer reuse.
+        """
+        return [
+            key
+            for key, (_, obj) in self._l1_manager.reserve_read(
+                keys, internal=True, retained_only=retained_only
+            ).items()
+            if obj is not None
+        ]
+
+    def release_read_pins(self, keys: list[ObjectKey]) -> None:
+        """Release publication ownership without triggering reuse writes."""
+        if keys:
+            self._l1_manager.release_internal_reads(keys)
+
+    def finish_write_pinned(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Commit new payloads and atomically keep them pinned for publication.
+
+        Return successfully committed keys. The caller owns one read pin per
+        returned key, including on partial success, and must release it.
+        """
+        result = self._l1_manager.finish_write_and_reserve_read(
+            keys, notify_store=True, internal=True
+        )
+        succeeded = [
+            key for key, (error, _) in result.items() if error == L1Error.SUCCESS
+        ]
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_WRITE_FINISHED,
+                metadata={
+                    "succeeded_keys": succeeded,
+                    "failed_keys": [key for key in keys if key not in succeeded],
+                },
+            )
+        )
+        return succeeded
+
+    def checkpoint_publication_budget(self) -> int:
+        """Bound aggregate pending publication bytes below the L1 watermark."""
+        _, total = self._l1_manager.get_memory_usage()
+        return int(total * self._eviction_controller.trigger_watermark)
+
+    def checkpoint_allocation_bytes(self, page_bytes: int) -> int:
+        """Return the aligned RAM charge for one checkpoint page."""
+        alignment = self._l1_memory_desc.align_bytes
+        return ((page_bytes + alignment - 1) // alignment) * alignment
+
+    def is_l1_evictable(self, key: ObjectKey) -> bool:
+        """Check eligibility; actual deletion rechecks ownership atomically."""
+        return self._l1_manager.is_key_evictable(key)
+
+    def can_cancel_persistence(self, key: ObjectKey) -> bool:
+        """Whether only queued backend work can be cancelled for this page."""
+        return self._store_controller.owns_queued(key)
+
+    def cancel_queued_persistence(self, keys: list[ObjectKey]) -> None:
+        """Release unsubmitted persistence for coherently retired pages."""
+        self._store_controller.cancel_queued(keys)
 
     @property
     def store_admission_timeout_seconds(self) -> float:
@@ -611,23 +687,36 @@ class StorageManager:
             retention.record_l2_present(
                 adapter_id, list(inventory), list(inventory.values())
             )
+        if adapter.has_complete_inventory():
+            retention.set_inventory_complete(adapter_id)
+
+    def flush_checkpoints(self) -> None:
+        """Perform the configured bounded flush while the directory is open."""
+        if self._checkpoint_shutdown_flushed:
+            return
+        try:
+            self._flush_current_checkpoints()
+        finally:
+            # No payload may be retired after its directory has closed.
+            self._eviction_controller.stop()
+            self._l2_eviction_controller.stop()
+            self._checkpoint_shutdown_flushed = True
 
     def _flush_current_checkpoints(self) -> None:
         """Write current checkpoint pages still only in L1 to L2 on shutdown."""
         retention = self._checkpoint_retention
         budget = self._checkpoint_shutdown_flush_seconds
-        if not retention.write_on_evict or budget <= 0 or not self._has_l2_adapters():
+        if budget <= 0 or not self._has_l2_adapters():
             return
-        count = self._l1_manager.num_objects()
-        keys, _ = self._l1_manager.get_evictable_keys(limit=count, scan_limit=count)
+        keys = self._l1_manager.readable_key_sizes()
         pending = [
             key
             for key in keys
             if is_recurrent_checkpoint_key(key)
-            and not retention.is_superseded(key)
             and not retention.is_l2_resident(key)
+            and retention.is_retained(key)
         ]
-        if not pending:
+        if not pending and not self._store_controller.has_pending_work():
             return
         logger.info(
             "Writing %d current checkpoint pages to L2 before shutdown (budget %.0f s)",
@@ -635,10 +724,13 @@ class StorageManager:
             budget,
         )
         start = time.monotonic()
-        retention.request_persist(pending)
         while time.monotonic() - start < budget:
             pending = [key for key in pending if not retention.is_l2_resident(key)]
-            if not pending:
+            if retention.write_on_evict:
+                retention.request_persist(pending)
+            if not self._store_controller.has_pending_work() and (
+                not pending or not retention.write_on_evict
+            ):
                 break
             time.sleep(0.2)
         if pending:
@@ -953,13 +1045,27 @@ class StorageManager:
             done, None if it's still in progress. Derive the prefix hit count
             via ``count_leading_ones``.
         """
+        result = self.query_prefetch_status_detailed(handle)
+        return result.found if result is not None else None
+
+    def query_prefetch_status_detailed(
+        self, handle: PrefetchHandle
+    ) -> PrefetchResult | None:
+        """Consume original-position hits and actual load-reservation evidence.
+
+        Legacy bitmap queries consume the same result. Backend misses alone do
+        not prove missing payload; no post-hoc free-memory inference is made.
+        """
         l2_r: Bitmap | None = None
+        reservation_failed = False
         if handle.prefetch_request_id != -1:
-            l2_r = self._prefetch_controller.query_prefetch_result(
+            result = self._prefetch_controller.query_prefetch_result_detailed(
                 handle.prefetch_request_id
             )
-            if l2_r is None:
+            if result is None:
                 return None
+            l2_r = result.found
+            reservation_failed = result.reservation_failed
 
         found = self._combine_found(handle, l2_r)
         # popcount (not count_leading_ones) so the log is accurate for
@@ -983,7 +1089,7 @@ class StorageManager:
                 handle.external_request_id,
                 handle.prefetch_request_id,
             )
-        return found
+        return PrefetchResult(found, reservation_failed)
 
     def touch_l1_keys(self, keys: list[ObjectKey]):
         """
@@ -1024,9 +1130,15 @@ class StorageManager:
                 and the number refused because they were locked (non-force only).
                 Missing keys are a no-op, so the operation is idempotent.
         """
-        results = self._l1_manager.delete(keys, force=force)
+        results = self._checkpoint_retention.evict(
+            keys,
+            "l1-force" if force else "l1",
+            lambda selected: self._l1_manager.delete(selected, force=force),
+        )
         deleted = sum(1 for err in results.values() if err == L1Error.SUCCESS)
-        skipped = sum(1 for err in results.values() if err == L1Error.KEY_IS_LOCKED)
+        skipped = sum(
+            1 for err in results.values() if err == L1Error.KEY_IS_LOCKED
+        ) + len(set(keys) - set(results))
         return deleted, skipped
 
     def unsafe_read(
@@ -1379,14 +1491,23 @@ class StorageManager:
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
-        self._l1_manager.clear(force=force)
+        if force:
+            # Forced administrative deletion retains its documented unsafe-copy
+            # semantics; retire directory entries before discarding buffers.
+            self._checkpoint_retention.evict(
+                self._l1_manager.keys(),
+                "l1-force",
+                lambda keys: self._l1_manager.delete(keys, force=True),
+            )
+        else:
+            self.delete_l1_keys(self._l1_manager.keys())
 
     def close(self):
         """
         Close the storage manager and release all resources.
         """
         try:
-            self._flush_current_checkpoints()
+            self.flush_checkpoints()
         except Exception:
             logger.exception("Shutdown checkpoint flush failed")
         self._l1_manager.begin_shutdown()
@@ -1399,6 +1520,9 @@ class StorageManager:
 
         for adapter in self._l2_adapters.values():
             adapter.close()
+
+        self._store_controller.release_stopped_ownership()
+        self._prefetch_controller.release_stopped_ownership()
 
         self._l1_manager.close()
 

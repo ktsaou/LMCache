@@ -117,9 +117,9 @@ Select policies via CLI:
    * - ``--l2-store-policy``
      - ``checkpoint_on_evict``
      - Store ordinary keys like ``default``.  Keep new recurrent checkpoint
-       pages in L1 and store a page to L2 once, when L1 is about to evict it
-       and no newer checkpoint of the same conversation has superseded it.
-       On shutdown, current pages still only in L1 are written within
+       pages in L1 and persist retained pages under memory pressure.
+       Supersession is an eviction hint, not proof an older branch is dead.
+       On shutdown, retained pages still only in L1 are written within
        ``--checkpoint-shutdown-flush-seconds``.  See
        :ref:`checkpoint-retention`.
    * - ``--l2-prefetch-policy``
@@ -458,32 +458,42 @@ not extend.  Checkpoints of the same request and ``instruction``
 checkpoints, which other conversations share, are never marked.  With every
 store policy:
 
-* L1 eviction drops superseded pages before any LRU victim.
-* L2 eviction deletes superseded pages before any LRU victim.
+* Supersession and recency guide eviction; shared dependencies remain protected.
+* Planned loss of the final known copy retires affected directory entries first.
 
 With ``--l2-store-policy checkpoint_on_evict`` in addition:
 
-* A current checkpoint page is written to L2 once, when L1 is about to
-  evict it, instead of on every request.  L1 keeps the page until the
-  write completes (at most ``--checkpoint-write-timeout-seconds``).
-* A superseded page is never written to L2.
-* Shutdown writes current pages still only in L1, so they can be restored
-  after a restart.
+* Retained checkpoint pages are offered to L2 under RAM pressure or shutdown.
+  Existing disk copies are reused, including pages shared between checkpoints.
+* Queued and active persistence have an allocated-byte budget. Transient failures
+  retry missing replicas; a failed replica does not starve a healthy destination.
+* If capacity cannot be reclaimed within bounded admission waits, cold checkpoints
+  may be retired coherently. Unneeded queued writes can be cancelled, while active
+  operations retain their buffers until completion. The legacy
+  ``--checkpoint-write-timeout-seconds`` option no longer releases pages by age.
+* Shutdown attempts persistence within ``--checkpoint-shutdown-flush-seconds``;
+  remaining RAM-only generations may be lost and are removed from the directory.
+  Other policies drain already eligible writes without making unused on-reuse
+  checkpoints eligible.
 
-Superseded manifests stay listed, so a request that branches from an older
-turn can still restore it while its pages last; when a page is gone, the
-restore falls back to the longest remaining checkpoint.
+An older branch remains eligible until retirement. Recovery prunes manifests
+whose payloads are provably missing; adapters without a complete inventory keep
+lookup candidates for validation. Unknown inventory never certifies another copy
+during planned deletion. Restores validate all required pages and fall back to
+the longest complete compatible checkpoint still retained.
 
 **Sizing.**  With write-through (``default``) the L2 retention time is about::
 
     L2 capacity / (requests per minute x checkpoint bytes per request)
 
-With ``checkpoint_on_evict`` the L2 receives roughly one current checkpoint
-per conversation that leaves L1, so retention is about::
+With ``checkpoint_on_evict``, write savings depend on checkpoints retiring before
+they need persistence. Retaining every branch can eventually write as much as
+write-through. Estimate retention from the measured workload::
 
-    L2 capacity / (conversations leaving L1 per minute x checkpoint bytes)
+    L2 capacity / checkpoint payload bytes written per minute
 
-and superseded pages are reclaimed first.  The
+The
 ``lmcache_mp_checkpoint_retention`` gauge reports, per ``stat``, superseded
 pages, L1 drops and L2 evictions of superseded pages, write-on-evict
-requests, completions and timeouts, and the checkpoint bytes held in L2.
+requests, completions, explicit retirements, and the checkpoint bytes held in L2.
+The legacy write-timeout counter remains zero; source ownership does not expire.

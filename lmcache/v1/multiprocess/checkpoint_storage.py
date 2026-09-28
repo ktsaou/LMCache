@@ -7,11 +7,12 @@ Every lease remains pinned until its worker reports completion of the copy.
 """
 
 # Standard
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 import hashlib
 import json
-import threading
 import time
 import uuid
 
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
     from lmcache.v1.memory_management import MemoryObj
 
 logger = init_logger(__name__)
+_DeleteResult = TypeVar("_DeleteResult")
 
 # A retrieve waiting for RAM asks the L1 eviction loop again after this many
 # seconds, as store admission does: a pass frees nothing while its victims are
@@ -214,6 +216,7 @@ class _StoreLease:
     manifest: CheckpointManifest
     rank: int
     keys: list[ObjectKey]
+    reused: list[ObjectKey] = field(default_factory=list)
     started: float = field(default_factory=time.monotonic)
 
 
@@ -243,13 +246,10 @@ class CheckpointPayloadStore:
         index: Directory used for all-rank publication and stale invalidation.
         max_leases: Shared bound for pending stores and retrieves. Exhaustion
             rejects admission without recycling a worker's live SHM buffers.
-        abandoned_after_seconds: Age after which a lease or pending generation
-            is treated as abandoned by a dead worker and released; 0 disables
-            reclaiming. It must be far longer than any live transfer. A worker
-            whose copy could not drain (UnsafeCheckpointCopyError) keeps its
-            lease on purpose because its DMA may still touch those pages;
-            reclaiming releases that lease too, which is safe only because a
-            copy still running after this long means a hung CUDA context.
+        abandoned_after_seconds: Age after which unexposed lookups and pending
+            generations are cancelled; 0 disables automatic cancellation.
+            Exposed copy buffers stay owned until the worker reports completion.
+            Elapsed time cannot prove that a CUDA transfer has stopped.
 
     The caller stages a manifest with ``index.begin`` before rank stores. Each
     successful store acknowledgement follows a drained worker D2H transfer.
@@ -277,7 +277,38 @@ class CheckpointPayloadStore:
         self._store_ranks: set[tuple[str, int]] = set()
         self._retrieves: dict[str, _RetrieveLease] = {}
         self._retrieve_admissions: set[str] = set()
-        self._lock = threading.Lock()
+        self._lock = index.lifecycle_lock
+        self._completed: dict[str, list[ObjectKey]] = {}
+        self._completed_ranks: dict[str, set[int]] = {}
+        self._publication_bytes: dict[str, int] = {}
+        self._generations: OrderedDict[str, dict[ObjectKey, int]] = OrderedDict()
+        self._owners: dict[ObjectKey, set[str]] = {}
+        self._published: set[str] = set()
+        self._deleting: dict[ObjectKey, set[str | int]] = {}
+        self._closed = False
+        self._accepting = True
+        index.add_lifecycle_listener(self._index_changed, self._before_index_close)
+        storage.checkpoint_retention.set_lifecycle(
+            evict=self._evict_pages,
+            pressure=self._retire_under_pressure,
+            retained=self._is_retained,
+            order=self._persistence_order,
+            reconcile=self._reconcile_replicas,
+        )
+        with self._lock:
+            for manifest in index.manifests():
+                self._register_manifest(manifest)
+                self._published.add(manifest.generation)
+                keys = list(self._generations[manifest.generation])
+                readable = set(storage.get_readable_keys(keys, retained_only=True))
+                if storage.checkpoint_retention.inventories_complete() and any(
+                    key not in readable
+                    and not storage.checkpoint_retention.is_l2_resident(
+                        key, self._generations[manifest.generation][key]
+                    )
+                    for key in keys
+                ):
+                    index.invalidate(manifest.generation)
 
     def prepare_store(
         self, manifest: CheckpointManifest, rank: int
@@ -304,8 +335,28 @@ class CheckpointPayloadStore:
             return None
         identity = (manifest.generation, rank)
         with self._lock:
-            if identity in self._store_ranks:
+            if not self._accepting:
+                return None
+            if identity in self._store_ranks or rank in self._completed_ranks.get(
+                manifest.generation, set()
+            ):
                 raise ValueError("checkpoint rank already has a store lease")
+            if any(key in self._deleting for group in key_groups for key in group):
+                return AdmissionFailure.BUSY
+            self._register_manifest(manifest)
+            if manifest.generation not in self._publication_bytes:
+                footprint = manifest.world_size * sum(
+                    self._storage.checkpoint_allocation_bytes(group.page_bytes)
+                    * len(group.positions)
+                    for group in groups
+                )
+                if (
+                    footprint + sum(self._publication_bytes.values())
+                    > self._storage.checkpoint_publication_budget()
+                ):
+                    self._index.abort(manifest.generation)
+                    return None
+                self._publication_bytes[manifest.generation] = footprint
             if (
                 len(self._store_ranks)
                 + len(self._retrieves)
@@ -316,18 +367,23 @@ class CheckpointPayloadStore:
                 return None
             self._store_ranks.add(identity)
         reserved: list[ObjectKey] = []
+        reused: list[ObjectKey] = []
 
         def attempt() -> AdmissionAttempt[
             tuple[tuple[ShmSlotDescriptor | None, ...], ...]
         ]:
-            if not self._index.is_pending(manifest):
-                return AdmissionAttempt.failure(AdmissionFailure.CONFLICT)
+            with self._lock:
+                if not self._index.is_pending(manifest):
+                    return AdmissionAttempt.failure(AdmissionFailure.CONFLICT)
+                if any(key in self._deleting for group in key_groups for key in group):
+                    return AdmissionAttempt.failure(AdmissionFailure.BUSY)
             slots: list[tuple[ShmSlotDescriptor | None, ...]] = []
             for group, keys in zip(groups, key_groups, strict=True):
                 detailed = self._storage.reserve_write_detailed(
                     list(keys),
                     MemoryLayoutDesc([torch.Size([group.page_bytes])], [torch.uint8]),
                     "new",
+                    internal=True,
                 )
                 objects = {
                     key: obj
@@ -341,10 +397,17 @@ class CheckpointPayloadStore:
                     if detailed.get(key, (L1Error.KEY_NOT_EXIST, None))[0]
                     is L1Error.KEY_NOT_WRITABLE
                 ]
-                readable = set(self._storage.get_readable_keys(existing_candidates))
+                readable = set(
+                    self._storage.pin_readable_keys(
+                        existing_candidates, retained_only=True
+                    )
+                )
+                reused.extend(readable)
                 if len(objects) + len(readable) != len(keys):
                     self._storage.abort_write(reserved)
                     reserved.clear()
+                    self._storage.release_read_pins(reused)
+                    reused.clear()
                     missing = [
                         key
                         for key in keys
@@ -400,13 +463,14 @@ class CheckpointPayloadStore:
                 return AdmissionFailure.BUSY if retryable else None
             lease_id = uuid.uuid4().hex
             with self._lock:
-                self._stores[lease_id] = _StoreLease(manifest, rank, reserved)
+                self._stores[lease_id] = _StoreLease(manifest, rank, reserved, reused)
             admitted = True
             return CheckpointSlots(lease_id, outcome.value)
         finally:
             if not admitted:
                 try:
                     self._storage.abort_write(reserved)
+                    self._storage.release_read_pins(reused)
                 finally:
                     try:
                         if not retryable:
@@ -430,28 +494,32 @@ class CheckpointPayloadStore:
             lease = self._stores.pop(lease_id, None)
         if lease is None:
             return False
-        try:
-            if not success:
-                self._storage.abort_write(lease.keys)
-                self._index.abort(lease.manifest.generation)
-                return False
-            self._storage.finish_write(lease.keys)
-            if len(self._storage.get_readable_keys(lease.keys)) != len(lease.keys):
-                self._index.abort(lease.manifest.generation)
-                return False
-            return self._index.acknowledge(lease.manifest.generation, lease.rank)
-        except Exception:
-            # Commit can fail before releasing every exclusive write lock.
-            # abort_write leaves already-readable objects intact; none become
-            # discoverable through this generation after publication is aborted.
+        with self._lock:
+            pinned = list(lease.reused)
             try:
+                if not success or not self._index.is_pending(lease.manifest):
+                    self._storage.abort_write(lease.keys)
+                    self._index.abort(lease.manifest.generation)
+                    return False
+                committed = self._storage.finish_write_pinned(lease.keys)
+                pinned.extend(committed)
+                if len(committed) != len(lease.keys):
+                    self._storage.abort_write(lease.keys)
+                    self._index.abort(lease.manifest.generation)
+                    return False
+                self._completed.setdefault(lease.manifest.generation, []).extend(pinned)
+                self._completed_ranks.setdefault(lease.manifest.generation, set()).add(
+                    lease.rank
+                )
+                pinned = []
+                return self._index.acknowledge(lease.manifest.generation, lease.rank)
+            except Exception:
                 self._storage.abort_write(lease.keys)
-            finally:
                 self._index.abort(lease.manifest.generation)
-            raise
-        finally:
-            with self._lock:
-                self._store_ranks.remove((lease.manifest.generation, lease.rank))
+                raise
+            finally:
+                self._storage.release_read_pins(pinned)
+                self._store_ranks.discard((lease.manifest.generation, lease.rank))
 
     def begin_retrieve(self, manifest: CheckpointManifest, rank: int) -> str | None:
         """Start asynchronous RAM/filesystem lookup for every page of one rank.
@@ -473,6 +541,8 @@ class CheckpointPayloadStore:
         ]
         lease_id = uuid.uuid4().hex
         with self._lock:
+            if not self._accepting:
+                return None
             if (
                 len(self._store_ranks)
                 + len(self._retrieves)
@@ -515,36 +585,17 @@ class CheckpointPayloadStore:
         self.reclaim_abandoned()
 
     def reclaim_abandoned(self) -> int:
-        """Release leases and pending generations that a dead worker left behind.
+        """Cancel stale publication and unexposed lookups without recycling DMA.
 
-        A worker that dies between PREPARE_STORE and FINISH_STORE, or between
-        a ready retrieve and its release, never returns its lease. The lease
-        keeps its L1 locks and counts against ``max_leases``, and its pending
-        generation can never be staged again. Once older than
-        ``abandoned_after_seconds``, store leases are aborted, ready retrieve
-        leases release their read locks, and pending lookups are cancelled and
-        drained as their prefetch completes.
+        Completed ranks release their publication pins when their generation
+        aborts. Live writers and exposed retrieves require explicit completion;
+        their buffers remain bounded by the pool and lease admission limits.
 
         Returns:
-            Number of leases and pending generations released.
+            Number of cancelled lookups and aborted pending generations.
         """
         cutoff = time.monotonic() - self._abandoned_after
         with self._lock:
-            stores = [
-                (lease_id, lease)
-                for lease_id, lease in self._stores.items()
-                if lease.started < cutoff
-            ]
-            for lease_id, lease in stores:
-                del self._stores[lease_id]
-                self._store_ranks.discard((lease.manifest.generation, lease.rank))
-            ready = [
-                (lease_id, lease)
-                for lease_id, lease in self._retrieves.items()
-                if lease.slots is not None and lease.started < cutoff
-            ]
-            for lease_id, _lease in ready:
-                del self._retrieves[lease_id]
             lookups = [
                 lease_id
                 for lease_id, lease in self._retrieves.items()
@@ -552,11 +603,6 @@ class CheckpointPayloadStore:
             ]
             for lease_id in lookups:
                 self._retrieves[lease_id].cancelled = True
-        for _lease_id, store_lease in stores:
-            self._storage.abort_write(store_lease.keys)
-            self._index.abort(store_lease.manifest.generation)
-        for _lease_id, read_lease in ready:
-            self._storage.finish_read_prefetched(read_lease.keys)
         for lease_id in lookups:
             try:
                 # A cancelled lookup releases its locks once its prefetch ends.
@@ -564,13 +610,11 @@ class CheckpointPayloadStore:
             except KeyError:
                 pass
         stale = self._index.abort_stale(self._abandoned_after)
-        reclaimed = len(stores) + len(ready) + len(lookups) + len(stale)
+        reclaimed = len(lookups) + len(stale)
         if reclaimed:
             logger.warning(
-                "Released %d store leases, %d retrieve leases, %d lookups and %d "
+                "Cancelled %d lookups and %d "
                 "pending checkpoint generations abandoned for over %.0f s",
-                len(stores),
-                len(ready),
                 len(lookups),
                 len(stale),
                 self._abandoned_after,
@@ -592,6 +636,31 @@ class CheckpointPayloadStore:
                 "max_leases": self._max_leases,
             }
 
+    def quiesce(self) -> None:
+        """Close admission atomically with the idle check.
+
+        Raises RuntimeError if a worker still owns copy buffers or an admission
+        is in progress. A failed attempt leaves the service usable so workers
+        can finish and the caller can retry closure.
+        """
+        with self._lock:
+            if self._store_ranks or self._retrieves or self._retrieve_admissions:
+                raise RuntimeError(
+                    "Checkpoint worker copy leases must drain before close"
+                )
+            self._accepting = False
+
+    def prepare_terminal_shutdown(self) -> None:
+        """Stop admission and flush the directory without releasing live copies.
+
+        Terminal process shutdown may leave leases from workers already killed
+        by the supervisor. Those buffers remain owned until process termination;
+        closing their metadata never authorizes recycling their memory.
+        """
+        with self._lock:
+            self._accepting = False
+        self._index.close()
+
     def poll_retrieve(self, lease_id: str) -> CheckpointSlots | bool | None:
         """Return slots only when every required page is readable and pinned.
 
@@ -600,16 +669,12 @@ class CheckpointPayloadStore:
 
         Returns:
             None while prefetch is pending, False on a miss/cancellation, or
-            the pinned slots. A miss releases all acquired locks and invalidates
-            only the failed generation. It must not advance computed tokens.
-
-            The storage manager loads pages from L2 only into RAM it reserved
-            for all of them, so a full RAM leaves stored pages unread. A lookup
-            with unread pages is therefore repeated once RAM has room for them,
-            and only a repeated lookup that had that room invalidates the
-            generation. The lease stays pending while eviction makes room, for
-            at most the storage admission timeout; a lease that never gets
-            room misses without invalidating its generation.
+            the pinned slots. A miss releases all acquired locks and must not
+            advance computed tokens. Reservation failures retry within the
+            original admission deadline, using aligned allocation sizes.
+            Unknown backend misses preserve the generation: failed I/O is not
+            proof of missing stored pages. Coordinated retirement and recovery
+            remove manifests whose payloads are known to be lost.
 
         Raises:
             KeyError: If the lease is unknown or already finished.
@@ -621,13 +686,21 @@ class CheckpointPayloadStore:
                 return lease.slots
             if lease.handle is None:
                 return self._repeat_with_room(lease_id, lease)
-            found = self._storage.query_prefetch_status(lease.handle)
-            if found is None:
+            result = self._storage.query_prefetch_status_detailed(lease.handle)
+            if result is None:
                 return None
+            found = result.found
             readable_keys = [key for i, key in enumerate(lease.keys) if found.test(i)]
             if len(readable_keys) != len(lease.keys) or lease.cancelled:
                 self._storage.finish_read_prefetched(readable_keys)
-                return self._repeat_or_miss(lease_id, lease, readable_keys)
+                return self._repeat_or_miss(
+                    lease_id, lease, readable_keys, result.reservation_failed
+                )
+            pinned = self._storage.pin_readable_keys(lease.keys)
+            if pinned != lease.keys:
+                self._storage.release_read_pins(pinned)
+                self._storage.finish_read_prefetched(lease.keys)
+                return self._repeat_or_miss(lease_id, lease, [], True)
             try:
                 keys, objects = self._storage.unsafe_read(lease.keys)
                 if keys != lease.keys or len(objects) != len(keys):
@@ -646,41 +719,54 @@ class CheckpointPayloadStore:
                 lease.slots = CheckpointSlots(lease_id, tuple(slots))
                 return lease.slots
             except Exception:
+                self._storage.release_read_pins(pinned)
                 self._storage.finish_read_prefetched(lease.keys)
                 self._index.invalidate(lease.manifest.generation)
                 del self._retrieves[lease_id]
                 raise
 
     def _repeat_or_miss(
-        self, lease_id: str, lease: _RetrieveLease, readable_keys: list[ObjectKey]
+        self,
+        lease_id: str,
+        lease: _RetrieveLease,
+        readable_keys: list[ObjectKey],
+        reservation_failed: bool = False,
     ) -> bool | None:
         """Repeat or end a lookup whose pages were not all pinned.
 
         Called with the lookup's read locks already released. Returns None
         when the lookup will be repeated, otherwise False after forgetting the
-        lease. Only a repeated lookup that had room in RAM invalidates.
+        lease. An unavailable page does not prove that its stored copy is lost.
         """
         lease.readable = len(readable_keys)
         if lease.cancelled:
             return self._miss(lease_id, lease, "was cancelled by the engine")
+        if self._index.get(lease.manifest.generation) is None:
+            return self._miss(
+                lease_id, lease, "missed; its checkpoint is no longer listed"
+            )
         groups = checkpoint_page_groups(lease.manifest)
         readable = set(readable_keys)
         lease.unread_bytes = sum(
-            groups[key.object_group_id].page_bytes
+            self._storage.checkpoint_allocation_bytes(
+                groups[key.object_group_id].page_bytes
+            )
             for key in lease.keys
             if key not in readable
         )
-        used, total = self._storage.get_l1_usage()
-        # Without L2, or with more pages than RAM can hold, no repeat loads them.
+        _, total = self._storage.get_l1_usage()
         if (
             self._storage.l2_adapters()
             and lease.unread_bytes <= total
-            and (lease.lookups == 1 or total - used < lease.unread_bytes)
+            and (reservation_failed or lease.lookups == 1)
         ):
             lease.handle = None
             return self._repeat_with_room(lease_id, lease)
-        self._index.invalidate(lease.manifest.generation)
-        return self._miss(lease_id, lease, "missed; its checkpoint is no longer listed")
+        # Adapters can report a miss for failed I/O as well as absence. Only
+        # coordinated retirement/recovery provides authoritative loss evidence.
+        return self._miss(
+            lease_id, lease, "was unavailable; its checkpoint stays listed"
+        )
 
     def _repeat_with_room(self, lease_id: str, lease: _RetrieveLease) -> bool | None:
         """Repeat a waiting lookup once RAM can hold its unread pages.
@@ -692,16 +778,16 @@ class CheckpointPayloadStore:
         """
         if lease.cancelled:
             return self._miss(lease_id, lease, "was cancelled by the engine")
-        used, total = self._storage.get_l1_usage()
-        if total - used >= lease.unread_bytes:
-            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
-            lease.lookups += 1
-            return None
         now = time.monotonic()
         if now - lease.started >= self._storage.store_admission_timeout_seconds:
             return self._miss(
                 lease_id, lease, "found no room in RAM; its checkpoint stays listed"
             )
+        used, total = self._storage.get_l1_usage()
+        if total - used >= lease.unread_bytes:
+            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
+            lease.lookups += 1
+            return None
         if now - lease.eviction_requested >= _ROOM_REQUEST_INTERVAL_SECONDS:
             lease.eviction_requested = now
             self._storage.request_immediate_eviction()
@@ -737,11 +823,13 @@ class CheckpointPayloadStore:
                 return
             if lease.slots is None:
                 raise ValueError("checkpoint retrieval has not produced a read lease")
-            del self._retrieves[lease_id]
-        # A completed restore proves reuse; reuse-admission store policies
-        # store checkpoint pages to L2 only after such a report.
-        self._storage.notify_keys_reused(lease.keys)
-        self._storage.finish_read_prefetched(lease.keys)
+            # Keep admission/shutdown accounting until ownership cleanup ends.
+            try:
+                self._storage.notify_keys_reused(lease.keys)
+                self._storage.finish_read_prefetched(lease.keys)
+            finally:
+                self._storage.release_read_pins(lease.keys)
+                del self._retrieves[lease_id]
 
     def cancel_retrieve(self, lease_id: str) -> None:
         """Mark a pending lookup for draining without exposing its SHM slots.
@@ -761,3 +849,233 @@ class CheckpointPayloadStore:
                     "prepared checkpoint retrieval requires copy completion"
                 )
             lease.cancelled = True
+
+    def _index_changed(self, event: str, value: CheckpointManifest | str) -> None:
+        if event in {"publish", "touch"}:
+            assert isinstance(value, CheckpointManifest)
+            self._register_manifest(value)
+            self._generations.move_to_end(value.generation)
+            if event == "publish":
+                self._published.add(value.generation)
+        if event not in {"publish", "abort", "remove"}:
+            return
+        generation = (
+            value.generation if isinstance(value, CheckpointManifest) else value
+        )
+        if event in {"abort", "remove"}:
+            # Aborting an already published generation is a no-op.
+            if event != "abort" or generation not in self._published:
+                self._published.discard(generation)
+                for key in self._generations.pop(generation, {}):
+                    owners = self._owners[key]
+                    owners.discard(generation)
+                    if not owners:
+                        del self._owners[key]
+                        self._storage.checkpoint_retention.forget_pending([key])
+        self._storage.release_read_pins(self._completed.pop(generation, []))
+        self._completed_ranks.pop(generation, None)
+        self._publication_bytes.pop(generation, None)
+
+    def _before_index_close(self) -> None:
+        if self._closed:
+            return
+        with self._lock:
+            self._accepting = False
+            for generation in list(self._generations):
+                if generation in self._published:
+                    continue
+                self._index.abort(generation)
+        try:
+            self._storage.flush_checkpoints()
+        except Exception:
+            logger.exception(
+                "Checkpoint shutdown flush failed; retiring RAM-only entries"
+            )
+        with self._lock:
+            retention = self._storage.checkpoint_retention
+            lost = [
+                generation
+                for generation in self._published
+                if any(
+                    not retention.is_l2_resident(key, size)
+                    for key, size in self._generations[generation].items()
+                )
+            ]
+            for generation in lost:
+                self._index.invalidate(generation)
+            if lost:
+                logger.warning("Shutdown retired %d RAM-only checkpoints", len(lost))
+                retention.record_retirement(len(lost))
+            self._closed = True
+            retention.set_lifecycle(evict=None, pressure=None, retained=None)
+
+    def _register_manifest(self, manifest: CheckpointManifest) -> None:
+        if manifest.generation in self._generations:
+            return
+        sizes: dict[ObjectKey, int] = {}
+        groups = checkpoint_page_groups(manifest)
+        for rank in range(manifest.world_size):
+            for group, keys in zip(
+                groups, checkpoint_object_keys(manifest, rank), strict=True
+            ):
+                sizes.update((key, group.page_bytes) for key in keys)
+        self._generations[manifest.generation] = sizes
+        for key in sizes:
+            self._owners.setdefault(key, set()).add(manifest.generation)
+
+    def _is_retained(self, key: ObjectKey) -> bool:
+        with self._lock:
+            return key in self._owners
+
+    def _reconcile_replicas(self) -> None:
+        """Adapter removal can invalidate unenumerated recovered dependencies."""
+        with self._lock:
+            retention = self._storage.checkpoint_retention
+            for generation in list(self._published):
+                keys = list(self._generations[generation])
+                readable = set(
+                    self._storage.get_readable_keys(keys, retained_only=True)
+                )
+                if any(
+                    key not in readable
+                    and not retention.is_l2_resident(
+                        key, self._generations[generation][key]
+                    )
+                    for key in keys
+                ):
+                    self._index.invalidate(generation)
+                    retention.record_retirement(1)
+
+    def _persistence_order(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Prefer candidates that complete a checkpoint with fewer missing bytes."""
+        with self._lock:
+            retention = self._storage.checkpoint_retention
+            candidates = {owner for key in keys for owner in self._owners.get(key, ())}
+            missing = {
+                generation: [
+                    key
+                    for key in self._generations[generation]
+                    if not retention.is_l2_resident(
+                        key, self._generations[generation][key]
+                    )
+                ]
+                for generation in candidates
+            }
+            ranked = sorted(
+                [
+                    generation
+                    for generation in reversed(self._generations)
+                    if generation in candidates
+                ],
+                key=lambda generation: sum(
+                    self._generations[generation][key] for key in missing[generation]
+                ),
+            )
+            ordered = dict.fromkeys(
+                key for generation in ranked for key in missing[generation]
+            )
+            return list(ordered)
+
+    def _evict_pages(
+        self,
+        keys: list[ObjectKey],
+        tier: str | int,
+        delete: Callable[[list[ObjectKey]], _DeleteResult],
+    ) -> _DeleteResult:
+        """Fence payload deletion and retire affected last-copy generations."""
+        keys = list(dict.fromkeys(keys))
+        force = tier == "l1-force"
+        if force:
+            tier = "l1"
+        with self._lock:
+            if self._closed:
+                return delete(keys)
+            retention = self._storage.checkpoint_retention
+            readable = (
+                set(self._storage.get_readable_keys(keys, retained_only=True))
+                if tier != "l1"
+                else set()
+            )
+            selected = []
+            retired: set[str] = set()
+            for key in keys:
+                if tier in self._deleting.get(key, set()):
+                    continue
+                if (
+                    tier == "l1"
+                    and not force
+                    and not self._storage.is_l1_evictable(key)
+                ):
+                    continue
+                deleting = self._deleting.get(key, set())
+                owners = self._owners.get(key, set())
+                retained_l1 = tier != "l1" and key in readable and "l1" not in deleting
+                at_risk = {
+                    generation
+                    for generation in owners
+                    if not retained_l1
+                    and not (
+                        retention.resident_adapters(
+                            key, self._generations[generation][key]
+                        )
+                        - deleting
+                        - {tier}
+                    )
+                }
+                if at_risk - self._published and not force:
+                    continue
+                if force:
+                    for generation in list(at_risk - self._published):
+                        self._index.abort(generation)
+                retired.update(at_risk & self._published)
+                selected.append(key)
+            for generation in retired:
+                self._index.invalidate(generation)
+            retention.record_retirement(len(retired))
+            for key in selected:
+                self._deleting.setdefault(key, set()).add(tier)
+        try:
+            return delete(selected)
+        finally:
+            with self._lock:
+                for key in selected:
+                    self._deleting[key].discard(tier)
+                    if not self._deleting[key]:
+                        del self._deleting[key]
+
+    def _retire_under_pressure(self, target_bytes: int) -> int:
+        """Free unique pages of cold, inactive generations, preserving sharing."""
+        freed = 0
+        with self._lock:
+            candidates = list(self._generations)
+        for generation in candidates:
+            if freed >= target_bytes:
+                break
+            with self._lock:
+                if generation not in self._published:
+                    continue
+                sizes = self._generations[generation]
+                unique = [
+                    key
+                    for key in sizes
+                    if self._owners.get(key) == {generation}
+                    and (
+                        self._storage.is_l1_evictable(key)
+                        or self._storage.can_cancel_persistence(key)
+                    )
+                ]
+                if not unique:
+                    continue
+                # Shared dependencies survive retirement and need no extra write.
+                self._index.invalidate(generation)
+                self._storage.checkpoint_retention.record_retirement(1)
+                self._storage.cancel_queued_persistence(unique)
+                self._storage.delete_l1_keys(unique)
+                # Bound selection by bytes retired, including queued pins that
+                # the store loop will release. Admission still checks actual RAM.
+                freed += sum(
+                    self._storage.checkpoint_allocation_bytes(sizes[key])
+                    for key in unique
+                )
+                logger.info("Retired checkpoint under RAM pressure: %s", generation)
+        return freed

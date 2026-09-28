@@ -2,7 +2,7 @@
 """Scheduler ownership and all-rank publication of external recurrent checkpoints."""
 
 # Standard
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 import json
 import math
@@ -25,9 +25,8 @@ from lmcache.v1.multiprocess.protocols.base import RequestType
 
 logger = init_logger(__name__)
 
-# Directory lookups per request, including the first. A failed restore makes
-# the server invalidate the missing generation, so each retry receives the
-# longest candidate that is still listed rather than recomputing the prompt.
+# Directory lookups per request, including the first. Failed restores retry
+# strictly shorter candidates without requiring global manifest invalidation.
 _MAX_LOOKUP_ATTEMPTS = 4
 
 # Restores slower than this many seconds are logged even when they succeed;
@@ -618,8 +617,23 @@ class CheckpointSchedulerBridge:
                     state.task_id = None
                     state.attempts += 1
                     state.started = time.monotonic()
+                    # A publication race does not make the stored payload
+                    # unusable; only failed worker copies need a shorter prefix.
+                    limit = (
+                        pending.task.manifest.prefix.num_tokens
+                        if all(pending.acknowledgements.values())
+                        else pending.task.manifest.prefix.num_tokens - 1
+                    )
+                    shorter_roots = tuple(
+                        replace(
+                            root,
+                            tail_tokens=root.tail_tokens[: limit - root.start_tokens],
+                        )
+                        for root in state.roots.roots
+                        if root.start_tokens < limit
+                    )
                     state.future = self._client.submit_request(
-                        RequestType.CHECKPOINT_FIND, [state.roots.roots]
+                        RequestType.CHECKPOINT_FIND, [shorter_roots]
                     )
                 elif state is not None:
                     state.done = True
