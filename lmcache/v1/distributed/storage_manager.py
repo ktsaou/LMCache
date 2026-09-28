@@ -613,25 +613,36 @@ class StorageManager:
             )
 
     def _flush_current_checkpoints(self) -> None:
-        """Write current checkpoint pages still only in L1 to L2 on shutdown."""
+        """Write checkpoint pages still only in L1 to L2 on shutdown.
+
+        Current pages go first. Superseded pages follow within the same
+        budget: while serving they leave L1 without a write to spare flash,
+        but a shutdown writes each at most once, and their manifests stay
+        listed, so a request that continues an older line after the restart
+        (a branch, a resumed turn, a side request that extended the
+        conversation) restores instead of finding its pages gone.
+        """
         retention = self._checkpoint_retention
         budget = self._checkpoint_shutdown_flush_seconds
         if not retention.write_on_evict or budget <= 0 or not self._has_l2_adapters():
             return
         count = self._l1_manager.num_objects()
         keys, _ = self._l1_manager.get_evictable_keys(limit=count, scan_limit=count)
-        pending = [
+        unwritten = [
             key
             for key in keys
-            if is_recurrent_checkpoint_key(key)
-            and not retention.is_superseded(key)
-            and not retention.is_l2_resident(key)
+            if is_recurrent_checkpoint_key(key) and not retention.is_l2_resident(key)
         ]
+        current = [key for key in unwritten if not retention.is_superseded(key)]
+        superseded = [key for key in unwritten if retention.is_superseded(key)]
+        pending = current + superseded
         if not pending:
             return
         logger.info(
-            "Writing %d current checkpoint pages to L2 before shutdown (budget %.0f s)",
-            len(pending),
+            "Writing %d current and %d superseded checkpoint pages to L2 before "
+            "shutdown (budget %.0f s)",
+            len(current),
+            len(superseded),
             budget,
         )
         start = time.monotonic()

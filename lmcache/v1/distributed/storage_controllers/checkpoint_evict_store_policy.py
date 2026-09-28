@@ -13,8 +13,9 @@ same conversation) and not yet in L2, the page is written to L2 first and
 evicted after the write completes. A conversation that stays active never
 writes its checkpoints; one that goes idle writes its latest checkpoint once.
 Superseded pages are evicted without a write. Ordinary KV chunks keep
-write-through behavior. On a clean shutdown, current checkpoint pages still
-in L1 are written to L2 within the configured time budget.
+write-through behavior. On a clean shutdown, checkpoint pages still only in
+L1 are written to L2 within the configured time budget, current pages first
+and then superseded ones.
 
 Select it with ``--l2-store-policy checkpoint_on_evict``.
 """

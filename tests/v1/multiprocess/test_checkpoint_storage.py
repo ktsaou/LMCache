@@ -1371,7 +1371,7 @@ def test_superseded_checkpoint_is_dropped_first_and_never_written(
 def test_shutdown_flush_writes_current_checkpoints_for_the_next_start(
     tmp_path: Path, flush_seconds: float
 ) -> None:
-    """Current checkpoints still only in L1 reach L2 when the server stops."""
+    """Checkpoints still only in L1 reach L2 when the server stops."""
     current, superseded = make_manifest(), large_manifest(400, page_bytes=128)
     with open_store(
         tmp_path,
@@ -1389,7 +1389,9 @@ def test_shutdown_flush_writes_current_checkpoints_for_the_next_start(
         tmp_path, True, store_policy="checkpoint_on_evict", shutdown_flush_seconds=0
     ) as (service, index, storage, mapping):
         assert restores(service, mapping, current) == (flush_seconds > 0)
-        assert not restores(service, mapping, superseded)
+        # A superseded checkpoint stays listed, so the flush writes it too,
+        # after the current ones, and a branch can restore it after a restart.
+        assert restores(service, mapping, superseded) == (flush_seconds > 0)
 
 
 def publish_before_restart(
@@ -1616,6 +1618,60 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
                     prompt_2.generation,
                     "r2",
                 )
+        finally:
+            module.close()
+
+
+def test_a_branch_keeps_the_checkpoints_it_branched_before() -> None:
+    """A retry or resumed turn supersedes the prompt it extends, but not the
+    longer response the original line continues from (lmcache-supersession-repro)."""
+    name = f"lmcache_l1_pool_checkpoint_branch_{uuid.uuid4().hex}"
+    with open_store(shm_name=name) as (_, _, storage, mapping):
+        module = CheckpointModule(
+            cast(
+                MPCacheServerContext,
+                SimpleNamespace(
+                    storage_manager=storage,
+                    shm_pool_info={"shm_name": name, "pool_size": 4 * 1024 * 1024},
+                ),
+            )
+        )
+        try:
+            prompt_a = conversation_manifest((1, 2), "pa", kind="prompt")
+            response_a = conversation_manifest((1, 2, 5, 6, 7), "ra")
+            # An aborted turn resumed with one other token: shorter than A's
+            # response, so it branched before it.
+            prompt_b = conversation_manifest((1, 2, 9), "pb", kind="prompt")
+            # The original line continues past A's response.
+            prompt_c = conversation_manifest((1, 2, 5, 6, 7, 8), "pc", kind="prompt")
+            turns = (prompt_a, response_a, prompt_b, prompt_c)
+            for turn in turns:
+                assert module._index.begin(turn)
+                lease = module._payloads.prepare_store(turn, 0)
+                assert isinstance(lease, CheckpointSlots)
+                for group in lease.groups:
+                    for slot in group:
+                        if slot is not None:
+                            mapping[slot.offset : slot.offset + slot.length] = (
+                                b"\x01" * slot.length
+                            )
+                assert module._payloads.finish_store(lease.lease_id, True)
+            retention = storage.checkpoint_retention
+            assert module.supersede((prompt_a.prefix,), prompt_a.generation, "a") == 0
+            assert (
+                module.supersede((response_a.prefix,), response_a.generation, "a") == 0
+            )
+
+            module.supersede((prompt_b.prefix,), prompt_b.generation, "b")
+            unique_a = set(entry_keys(prompt_a)) - set(entry_keys(prompt_b))
+            assert unique_a and set(retention.superseded_keys()) == unique_a
+            assert not any(retention.is_superseded(k) for k in entry_keys(response_a))
+
+            module.supersede((prompt_c.prefix,), prompt_c.generation, "c")
+            current = set(entry_keys(prompt_c))
+            assert set(retention.superseded_keys()) == (
+                unique_a | (set(entry_keys(response_a)) - current)
+            )
         finally:
             module.close()
 

@@ -204,10 +204,14 @@ class CheckpointModule:
         checkpoint supersedes: the complete prompt of a new request replaces
         every published shorter checkpoint of its sequence that an earlier
         request produced, together with the other checkpoints of those
-        requests (a response endpoint that the chat template rewrote, a
-        prefill tail). Checkpoints of the same request and ``instruction``
-        checkpoints, which other conversations share, are kept. Pages the
-        new checkpoint references are current again.
+        requests that it has moved past (a response endpoint that the chat
+        template rewrote, a prefill tail). A checkpoint of such a request
+        that is at least as long as the new prompt is kept: the new request
+        branched off before it (a retry, or an aborted turn resumed with
+        other tokens), and the original line can still continue from it.
+        Checkpoints of the same request and ``instruction`` checkpoints,
+        which other conversations share, are kept. Pages the new checkpoint
+        references are current again.
 
         Superseded pages are evicted first and are never written to L2 on
         eviction. Their manifests stay listed, so a request that branches
@@ -236,7 +240,10 @@ class CheckpointModule:
             for sibling in self._generations_of(owner):
                 if sibling not in victims and sibling != generation:
                     manifest = self._index.get(sibling)
-                    if manifest is not None:
+                    if (
+                        manifest is not None
+                        and manifest.prefix.num_tokens < current.prefix.num_tokens
+                    ):
                         victims[sibling] = manifest
         selected = sorted(
             (
