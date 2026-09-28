@@ -493,10 +493,21 @@ Source: ``lmcache/v1/distributed/config.py``
        evicted without an L2 copy and a warning is logged.
    * - ``--checkpoint-shutdown-flush-seconds``
      - ``30``
-     - With ``checkpoint_on_evict``, how long shutdown waits while current
-       checkpoint pages still only in L1 are written to L2, so the next
-       start can restore them.  ``0`` skips the flush.  Give the process
-       at least this much time between SIGTERM and SIGKILL.
+     - Budget of a clean shutdown for recurrent checkpoints.  The server
+       first keeps serving checkpoint stores still in flight (at most a
+       third of the budget, at most 5 s, and only while stores are in
+       flight), so an engine stopping at the same time can publish them.
+       With ``checkpoint_on_evict`` it then writes checkpoint pages still
+       only in L1 to L2, current pages first, so the next start can restore
+       them.  ``0`` skips both.  Give the process at least this much time
+       between SIGTERM and SIGKILL.
+   * - ``--checkpoint-supersede-grace-seconds``
+     - ``300``
+     - How long a superseded recurrent checkpoint that a later prompt had
+       continued from (a branch point, such as a turn a sub-agent forked
+       from) keeps its eviction order before its pages are dropped first.
+       Superseded pages are never written to L2 while serving either way.
+       ``0`` drops them first at once.
    * - ``--l2-prefetch-policy``
      - ``default``
      - L2 prefetch policy.  Determines which adapter loads each key

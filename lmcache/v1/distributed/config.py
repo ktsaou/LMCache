@@ -332,12 +332,21 @@ class StorageManagerConfig:
     """ Total deadline for capacity-only L1 store admission retries. """
 
     checkpoint_shutdown_flush_seconds: float = 30.0
-    """ With write-on-evict checkpoint storage, time budget for writing
-    current checkpoint pages still in L1 to L2 during a clean shutdown. """
+    """ Time budget of a clean shutdown for checkpoint work: waiting for
+    checkpoint stores still in flight (at most a third of it), then, with
+    write-on-evict checkpoint storage, writing checkpoint pages still only
+    in L1 to L2, current pages first. 0 skips both. """
 
     checkpoint_write_timeout_seconds: float = 120.0
     """ With write-on-evict checkpoint storage, how long L1 keeps a page
     whose L2 write has not completed before evicting it without a copy. """
+
+    checkpoint_supersede_grace_seconds: float = 300.0
+    """ How long a superseded checkpoint that a later prompt continued from
+    (a branch point, such as a turn a side request or sub-agent extended)
+    keeps its eviction order before its pages are dropped first. Superseded
+    pages are never written to L2 while serving either way. 0 drops them
+    first at once. """
 
     def __post_init__(self) -> None:
         if self.store_admission_timeout_seconds < 0:
@@ -346,6 +355,8 @@ class StorageManagerConfig:
             raise ValueError("checkpoint_shutdown_flush_seconds must be >= 0")
         if self.checkpoint_write_timeout_seconds <= 0:
             raise ValueError("checkpoint_write_timeout_seconds must be > 0")
+        if self.checkpoint_supersede_grace_seconds < 0:
+            raise ValueError("checkpoint_supersede_grace_seconds must be >= 0")
         normalize_storage_manager_config(self)
         validate_storage_manager_config(self)
 
@@ -601,9 +612,21 @@ def add_storage_manager_args(
         "--checkpoint-shutdown-flush-seconds",
         type=float,
         default=30.0,
-        help="With --l2-store-policy checkpoint_on_evict, time budget for "
-        "writing current recurrent checkpoints still in L1 to L2 on a clean "
-        "shutdown. 0 skips the flush.",
+        help="Time budget of a clean shutdown for recurrent checkpoints: "
+        "waiting for checkpoint stores still in flight (at most a third of "
+        "it), then, with --l2-store-policy checkpoint_on_evict, writing "
+        "checkpoint pages still only in L1 to L2, current ones first. "
+        "0 skips both.",
+    )
+    parser.add_argument(
+        "--checkpoint-supersede-grace-seconds",
+        type=float,
+        default=300.0,
+        help="How long a superseded recurrent checkpoint that a later prompt "
+        "continued from (a branch point, such as a turn that a side request "
+        "or sub-agent extended) keeps its eviction order before its pages are "
+        "dropped first. Superseded pages are never written to L2 while "
+        "serving. 0 drops them first at once.",
     )
     parser.add_argument(
         "--checkpoint-write-timeout-seconds",
@@ -762,6 +785,9 @@ def parse_args_to_config(
         ),
         checkpoint_write_timeout_seconds=getattr(
             args, "checkpoint_write_timeout_seconds", 120.0
+        ),
+        checkpoint_supersede_grace_seconds=getattr(
+            args, "checkpoint_supersede_grace_seconds", 300.0
         ),
     )
     return config

@@ -668,6 +668,24 @@ class L2AdapterInterface(ABC):
         """
         return _EMPTY_KEY_SIZES
 
+    def absent_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return the given keys this adapter can confirm it does not hold.
+
+        Answered synchronously from cheap local state (in-process metadata,
+        or one ``stat`` per key for a filesystem), so it must see objects
+        that other processes sharing the backend stored. Callers use it to
+        tell a lost object from one this process never saw. The default
+        confirms nothing, which keeps callers from treating an unknown key
+        as lost.
+
+        Args:
+            keys: Keys to check.
+
+        Returns:
+            The keys that are certainly absent, in the order given.
+        """
+        return []
+
     def _initialize_usage(self, key_sizes: Mapping[ObjectKey, int]) -> None:
         """Seed byte accounting before the adapter accepts operations.
 

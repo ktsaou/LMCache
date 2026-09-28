@@ -15,6 +15,7 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _object_key_to_relative_path,
 )
 from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import (
+    _absent_native_fs_keys,
     _scan_existing_key_sizes,
 )
 
@@ -193,3 +194,22 @@ def test_scan_rejects_duplicate_decoded_keys(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="multiple filenames"):
         _scan_existing_key_sizes(str(tmp_path))
+
+
+def test_absence_probe_sees_objects_any_process_published(tmp_path) -> None:
+    """An object file under its canonical or legacy name counts as present,
+    whoever wrote it; only keys with neither file are confirmed absent."""
+    canonical, legacy, missing = _key(1), _key(2), _key(3)
+    oversized = ObjectKey(
+        chunk_hash=ObjectKey.IntHash2Bytes(4),
+        model_name="m" * 240,
+        kv_rank=0,
+        object_group_id=1,
+    )
+    for key in (canonical, oversized):
+        path = tmp_path / _object_key_to_relative_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"object")
+    (tmp_path / _object_key_to_filename(legacy)).write_bytes(b"object")
+    keys = [canonical, legacy, missing, oversized]
+    assert _absent_native_fs_keys(str(tmp_path), keys) == [missing]

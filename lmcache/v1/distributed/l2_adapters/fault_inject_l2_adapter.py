@@ -402,6 +402,10 @@ class FaultInjectL2Adapter(L2AdapterInterface):
         """Forward the persistent inventory owned by the inner adapter."""
         return self._inner.get_existing_key_sizes()
 
+    def absent_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Forward the absence check to the inner adapter, which holds the keys."""
+        return self._inner.absent_keys(keys)
+
     @property
     def supports_global_eviction(self) -> bool:
         """Whether the inner adapter supports aggregate usage-based eviction."""

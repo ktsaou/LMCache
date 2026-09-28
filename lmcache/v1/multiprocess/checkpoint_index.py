@@ -511,11 +511,26 @@ class CheckpointIndex:
             generation: Failed generation, not merely its shared token prefix.
                 Invalidating a replaced generation cannot remove its replacement.
         """
+        self.retire([generation])
+
+    def retire(self, generations: list[str]) -> None:
+        """Remove generations whose payload pages are lost, in one transaction.
+
+        Args:
+            generations: Published generations to delist; unknown ones are
+                ignored. A replacement published for the same prefix is kept.
+        """
+        if not generations:
+            return
+        rows = [(generation,) for generation in generations]
         with self._lock, self._db:
             for table in ("checkpoint_tails", "checkpoints"):
-                self._db.execute(
-                    f"DELETE FROM {table} WHERE generation=?", (generation,)
-                )
+                self._db.executemany(f"DELETE FROM {table} WHERE generation=?", rows)
+
+    def pending_count(self) -> int:
+        """Return the number of staged generations not yet published."""
+        with self._lock:
+            return len(self._pending)
 
     def report_status(self) -> dict[str, int]:
         """Return directory counts without asserting that payload pages are resident.

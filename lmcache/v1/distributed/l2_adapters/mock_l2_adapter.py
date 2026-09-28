@@ -364,6 +364,11 @@ class MockL2Adapter(L2AdapterInterface):
         if deleted_keys:
             self._notify_keys_deleted(deleted_keys, deleted_sizes)
 
+    def absent_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return the keys the mock does not hold; it keeps objects in memory."""
+        with self._lock:
+            return [key for key in keys if key not in self._memory_objects]
+
     # ``get_usage()`` is inherited from ``L2AdapterInterface``, which derives
     # the report from the byte counters maintained by ``_notify_keys_*``.
     # ``_current_size_bytes`` above is a local within-batch accumulator

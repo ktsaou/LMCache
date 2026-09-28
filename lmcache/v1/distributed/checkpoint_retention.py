@@ -8,22 +8,33 @@ newer checkpoint stay alive through it, so only the pages unique to the older
 checkpoint (recurrent endpoint state, a partial attention page, auxiliary
 state) become dead weight. This module keeps that knowledge:
 
-* Superseded pages are dropped first from L1 and L2 and are never written to
-  L2 when they leave L1.
+* Superseded pages are never written to L2 when they leave L1. Once stale
+  they are dropped first from L1 and L2. A page is stale as soon as it is
+  superseded, unless its checkpoint is one a later prompt continued from: a
+  branch point such as the end of a turn that a sub-agent forked from and
+  ran several turns on. For a grace period such pages keep their LRU
+  position instead, so the original line can still continue from them
+  while they are in RAM.
+* Before the last copy of a superseded page is deleted, the superseded
+  checkpoints that need it are retired from the directory, so a lookup
+  misses them cleanly and falls back to a shorter checkpoint at once.
 * With write-on-evict storage, a current checkpoint page is written to L2
   once, when L1 is about to evict it, instead of on every request.
 * L2 residency per adapter is tracked so a page that already reached L2 is
-  not written again.
+  not written again. A lookup uses it to find pages that may be lost, and
+  treats one as lost only when L1 does not hold it and every L2 adapter
+  confirms that it does not either.
 
 Everything is bounded in memory and safe to call from the store, eviction and
-request-handler threads. Forgetting an entry only costs an extra write or a
-later eviction; correctness never depends on this state, because restores
+request-handler threads. Forgetting a supersession only costs an extra write
+or a later eviction. Where no adapter can confirm an absence, restores still
 validate every page and fall back to a shorter checkpoint when one is gone.
 """
 
 # Standard
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 import threading
 import time
 
@@ -57,8 +68,30 @@ class _BoundedSet:
     def __len__(self) -> int:
         return len(self._items)
 
-    def items(self) -> list:
-        return list(self._items)
+
+@dataclass
+class _SupersededPage:
+    """A superseded page: when it may be dropped first, and who needs it."""
+
+    stale_at: float
+    """Monotonic time from which the page is dropped first."""
+
+    generations: set[str] = field(default_factory=set)
+    """Superseded checkpoints that reference the page."""
+
+
+def _all_present(keys: list[ObjectKey]) -> list[ObjectKey]:
+    """Default L1 lookup: without one, assume L1 may hold every page."""
+    return keys
+
+
+def _retire_nothing(generations: list[str]) -> None:
+    """Default retirement hook: without a directory there is nothing to delist."""
+
+
+def _all_absent(keys: list[ObjectKey]) -> list[ObjectKey]:
+    """Default L2 absence check: without L2 adapters no page is in L2."""
+    return keys
 
 
 class _AdapterResidencyListener(L2AdapterListener):
@@ -90,8 +123,13 @@ class CheckpointRetention:
             the storage manager once its store controller exists.
         max_superseded: Bound on remembered superseded pages.
         max_tracked: Bound on remembered L2-resident pages per adapter.
+        max_generations: Bound on remembered superseded and continued
+            checkpoints.
         persist_timeout: Seconds after which a page whose write never
             completed may be evicted from L1 without reaching L2.
+        supersede_grace_seconds: How long a superseded checkpoint that a
+            later prompt continued from keeps its LRU position before its
+            pages are dropped first. 0 drops every superseded page first.
     """
 
     def __init__(
@@ -103,18 +141,33 @@ class CheckpointRetention:
         max_tracked: int = 1048576,
         max_generations: int = 65536,
         persist_timeout: float = 120.0,
+        supersede_grace_seconds: float = 0.0,
     ) -> None:
+        if supersede_grace_seconds < 0:
+            raise ValueError("supersede_grace_seconds must be >= 0")
         self._write_on_evict = write_on_evict
         self._persist = persist
+        self._max_superseded = max_superseded
         self._max_tracked = max_tracked
+        self._max_generations = max_generations
         self._persist_timeout = persist_timeout
+        self._grace = supersede_grace_seconds
         self._lock = threading.Lock()
-        self._superseded = _BoundedSet(max_superseded)
-        self._superseded_generations = _BoundedSet(max_generations)
+        # Superseded pages in the order they were first marked.
+        self._superseded: OrderedDict[ObjectKey, _SupersededPage] = OrderedDict()
+        # Superseded checkpoints and the pages they alone referenced.
+        self._superseded_generations: OrderedDict[str, tuple[ObjectKey, ...]] = (
+            OrderedDict()
+        )
+        # Checkpoints a later prompt continued from.
+        self._continued = _BoundedSet(max_generations)
         # adapter id -> key -> size in bytes
         self._resident: dict[int, OrderedDict[ObjectKey, int]] = {}
         # key -> monotonic time its write was requested
         self._pending: dict[ObjectKey, float] = {}
+        self._l1_present: Callable[[list[ObjectKey]], list[ObjectKey]] = _all_present
+        self._l2_absent: Callable[[list[ObjectKey]], list[ObjectKey]] = _all_absent
+        self._retire: Callable[[list[str]], None] = _retire_nothing
         self._stats = {
             "superseded_checkpoints": 0,
             "superseded_pages": 0,
@@ -124,6 +177,8 @@ class CheckpointRetention:
             "write_on_evict_requests": 0,
             "write_on_evict_persisted": 0,
             "write_on_evict_timeouts": 0,
+            "retired_checkpoints": 0,
+            "restored_checkpoints": 0,
         }
 
     @property
@@ -133,6 +188,46 @@ class CheckpointRetention:
     def set_persist(self, persist: Callable[[list[ObjectKey]], None]) -> None:
         """Install the asynchronous L2 store callback."""
         self._persist = persist
+
+    def set_l1_lookup(
+        self, present: Callable[[list[ObjectKey]], list[ObjectKey]]
+    ) -> None:
+        """Install the L1 lookup used to decide whether a copy is the last.
+
+        Args:
+            present: Returns the given keys that L1 holds. It must not call
+                back into this object.
+        """
+        self._l1_present = present
+
+    def set_l2_absence(
+        self, absent: Callable[[list[ObjectKey]], list[ObjectKey]]
+    ) -> None:
+        """Install the check that confirms pages are in no L2 adapter.
+
+        Args:
+            absent: Returns the given keys that every L2 adapter confirms it
+                does not hold (all of them without adapters). It must not
+                call back into this object.
+        """
+        self._l2_absent = absent
+
+    def set_retirement(self, retire: Callable[[list[str]], None]) -> None:
+        """Install the hook that delists checkpoints whose pages are lost.
+
+        Args:
+            retire: Removes the given generations from the checkpoint
+                directory. It is called without this object's lock held,
+                before the page deletion that loses them, and must not raise.
+        """
+        with self._lock:
+            self._retire = retire
+
+    def clear_retirement(self, retire: Callable[[list[str]], None]) -> None:
+        """Remove ``retire`` if it is still the installed retirement hook."""
+        with self._lock:
+            if self._retire == retire:
+                self._retire = _retire_nothing
 
     def listener_for(self, adapter_id: int) -> L2AdapterListener:
         """Return a listener that records one adapter's checkpoint pages."""
@@ -146,6 +241,15 @@ class CheckpointRetention:
 
     # ----- supersession ---------------------------------------------------
 
+    def mark_continued(self, generation: str) -> None:
+        """Record that a later prompt directly continued from ``generation``.
+
+        Such a checkpoint may be a branch point: if it is superseded later,
+        its pages keep their eviction order for the grace period.
+        """
+        with self._lock:
+            self._continued.add(generation)
+
     def is_superseded_generation(self, generation: str) -> bool:
         with self._lock:
             return generation in self._superseded_generations
@@ -153,21 +257,37 @@ class CheckpointRetention:
     def mark_superseded(self, generation: str, keys: Iterable[ObjectKey]) -> int:
         """Mark one older checkpoint's unique pages as superseded.
 
+        The pages become stale at once, or after the grace period when a
+        later prompt continued from ``generation``.
+
         Args:
             generation: The older checkpoint's generation, remembered so the
-                same ancestor is not processed again.
+                same checkpoint is not processed again and can be retired
+                when one of its pages is lost.
             keys: Pages that no current checkpoint references.
 
         Returns:
             Number of pages newly marked.
         """
+        now = time.monotonic()
         added = 0
         with self._lock:
-            self._superseded_generations.add(generation)
-            for key in keys:
-                if key not in self._superseded:
+            stale_at = now + self._grace if generation in self._continued else now
+            pages = tuple(keys)
+            self._superseded_generations[generation] = pages
+            self._superseded_generations.move_to_end(generation)
+            while len(self._superseded_generations) > self._max_generations:
+                self._superseded_generations.popitem(last=False)
+            for key in pages:
+                page = self._superseded.get(key)
+                if page is None:
+                    self._superseded[key] = _SupersededPage(stale_at, {generation})
                     added += 1
-                self._superseded.add(key)
+                else:
+                    page.generations.add(generation)
+                    page.stale_at = max(page.stale_at, stale_at)
+            while len(self._superseded) > self._max_superseded:
+                self._superseded.popitem(last=False)
             self._stats["superseded_checkpoints"] += 1
             self._stats["superseded_pages"] += added
         return added
@@ -176,15 +296,147 @@ class CheckpointRetention:
         """Clear the superseded mark from pages a new checkpoint references."""
         with self._lock:
             for key in keys:
-                self._superseded.discard(key)
+                self._superseded.pop(key, None)
+
+    def mark_generation_current(
+        self, generation: str, keys: Iterable[ObjectKey]
+    ) -> bool:
+        """Make a superseded checkpoint current again.
+
+        Used when a lookup finds the checkpoint: a request continues from it,
+        so it is no longer dead weight, and a later prompt may supersede it
+        again.
+
+        Args:
+            generation: The found checkpoint.
+            keys: All of its pages.
+
+        Returns:
+            True if the checkpoint was superseded.
+        """
+        with self._lock:
+            was_superseded = (
+                self._superseded_generations.pop(generation, None) is not None
+            )
+            for key in keys:
+                self._superseded.pop(key, None)
+            if was_superseded:
+                self._stats["restored_checkpoints"] += 1
+        return was_superseded
 
     def is_superseded(self, key: ObjectKey) -> bool:
         with self._lock:
             return key in self._superseded
 
     def superseded_keys(self) -> list[ObjectKey]:
+        """Return every superseded page, stale or not, oldest mark first."""
         with self._lock:
-            return self._superseded.items()
+            return list(self._superseded)
+
+    def take_droppable_superseded(self) -> list[ObjectKey]:
+        """Return stale superseded pages that L1 holds, oldest mark first.
+
+        Stale pages that no tier holds any more are forgotten.
+        """
+        now = time.monotonic()
+        with self._lock:
+            stale = [
+                key for key, page in self._superseded.items() if page.stale_at <= now
+            ]
+        if not stale:
+            return []
+        present = set(self._l1_present(stale))
+        with self._lock:
+            for key in stale:
+                if key not in present and not self._is_resident_locked(key):
+                    self._superseded.pop(key, None)
+        return [key for key in stale if key in present]
+
+    # ----- retirement -----------------------------------------------------
+
+    def retire_before_l1_delete(self, keys: list[ObjectKey]) -> int:
+        """Retire superseded checkpoints that deleting ``keys`` from L1 loses.
+
+        Call it before L1 deletes ``keys``. A superseded page without an L2
+        copy is its last copy, so every superseded checkpoint that references
+        it is delisted first. Ordinary KV chunks return at once.
+
+        Args:
+            keys: Keys L1 is about to delete.
+
+        Returns:
+            Number of checkpoints retired.
+        """
+        tracked = self._tracked_superseded(keys)
+        if not tracked:
+            return 0
+        with self._lock:
+            lost = [key for key in tracked if not self._is_resident_locked(key)]
+        return self._retire_owners(lost)
+
+    def retire_before_l2_delete(self, adapter_id: int, keys: list[ObjectKey]) -> int:
+        """Retire superseded checkpoints that deleting ``keys`` from L2 loses.
+
+        Call it before adapter ``adapter_id`` deletes ``keys``. A superseded
+        page that neither L1 nor another adapter holds is its last copy.
+
+        Args:
+            adapter_id: The adapter about to delete ``keys``.
+            keys: Keys it is about to delete.
+
+        Returns:
+            Number of checkpoints retired.
+        """
+        tracked = self._tracked_superseded(keys)
+        if not tracked:
+            return 0
+        in_l1 = set(self._l1_present(tracked))
+        with self._lock:
+            lost = [
+                key
+                for key in tracked
+                if key not in in_l1
+                and not any(
+                    key in resident
+                    for other, resident in self._resident.items()
+                    if other != adapter_id
+                )
+            ]
+        return self._retire_owners(lost)
+
+    def _tracked_superseded(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        checkpoint_keys = [key for key in keys if is_recurrent_checkpoint_key(key)]
+        if not checkpoint_keys:
+            return []
+        with self._lock:
+            return [key for key in checkpoint_keys if key in self._superseded]
+
+    def _retire_owners(self, lost: list[ObjectKey]) -> int:
+        """Delist the superseded checkpoints that reference ``lost`` pages."""
+        if not lost:
+            return 0
+        now = time.monotonic()
+        with self._lock:
+            generations: set[str] = set()
+            for key in lost:
+                page = self._superseded.get(key)
+                if page is not None:
+                    generations.update(page.generations)
+            for generation in generations:
+                for key in self._superseded_generations.pop(generation, ()):
+                    page = self._superseded.get(key)
+                    if page is None:
+                        continue
+                    page.generations.discard(generation)
+                    if not page.generations:
+                        # Nothing listed needs it any more.
+                        page.stale_at = min(page.stale_at, now)
+                self._continued.discard(generation)
+            self._stats["retired_checkpoints"] += len(generations)
+            retire = self._retire
+        if generations:
+            retire(sorted(generations))
+        return len(generations)
 
     # ----- L2 residency ---------------------------------------------------
 
@@ -213,17 +465,50 @@ class CheckpointRetention:
 
     def is_l2_resident(self, key: ObjectKey) -> bool:
         with self._lock:
-            return any(key in resident for resident in self._resident.values())
+            return self._is_resident_locked(key)
+
+    def _is_resident_locked(self, key: ObjectKey) -> bool:
+        return any(key in resident for resident in self._resident.values())
+
+    def unavailable_pages(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return the checkpoint pages that no tier holds.
+
+        Pages recorded in L2 count as held. Of the others, a page is
+        unavailable when L1 does not hold it and every L2 adapter confirms
+        that it does not either; an adapter that cannot confirm an absence
+        keeps the page counted as held.
+
+        Args:
+            keys: Pages of one checkpoint.
+
+        Returns:
+            The unavailable pages, in the order given.
+        """
+        checkpoint_keys = [key for key in keys if is_recurrent_checkpoint_key(key)]
+        with self._lock:
+            candidates = [
+                key for key in checkpoint_keys if not self._is_resident_locked(key)
+            ]
+        if not candidates:
+            return []
+        in_l1 = set(self._l1_present(candidates))
+        candidates = [key for key in candidates if key not in in_l1]
+        if not candidates:
+            return []
+        return self._l2_absent(candidates)
 
     def superseded_in_adapter(
         self, adapter_id: int, max_bytes: int
     ) -> tuple[list[ObjectKey], int]:
-        """Return superseded pages one adapter holds, up to ``max_bytes``."""
+        """Return stale superseded pages one adapter holds, up to ``max_bytes``."""
         victims: list[ObjectKey] = []
         total = 0
+        now = time.monotonic()
         with self._lock:
             resident: dict[ObjectKey, int] = self._resident.get(adapter_id, {})
-            for key in self._superseded.items():
+            for key, page in self._superseded.items():
+                if page.stale_at > now:
+                    continue
                 size = resident.get(key)
                 if size is None:
                     continue
@@ -248,8 +533,9 @@ class CheckpointRetention:
         """Whether L1 must keep ``key`` until its L2 write completes.
 
         True for a current checkpoint page that is not in L2 yet, while its
-        write is still expected to finish. A superseded page, an ordinary KV
-        chunk or a page whose write timed out may be evicted.
+        write is still expected to finish. A superseded page (stale or in its
+        grace period), an ordinary KV chunk or a page whose write timed out
+        may be evicted.
         """
         if not self._write_on_evict or not is_recurrent_checkpoint_key(key):
             return False
@@ -257,7 +543,7 @@ class CheckpointRetention:
         with self._lock:
             if key in self._superseded:
                 return False
-            if any(key in resident for resident in self._resident.values()):
+            if self._is_resident_locked(key):
                 self._pending.pop(key, None)
                 return False
             requested = self._pending.get(key)
@@ -301,10 +587,14 @@ class CheckpointRetention:
         return [(value, {"stat": name}) for name, value in status.items()]
 
     def report_status(self) -> dict:
+        now = time.monotonic()
         with self._lock:
             return {
                 "write_on_evict": self._write_on_evict,
                 "superseded_pages_tracked": len(self._superseded),
+                "superseded_pages_in_grace": sum(
+                    1 for page in self._superseded.values() if page.stale_at > now
+                ),
                 "l2_resident_pages_tracked": sum(
                     len(resident) for resident in self._resident.values()
                 ),

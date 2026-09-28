@@ -212,21 +212,37 @@ class L1EvictionController(EvictionController):
             self._retention.request_persist(list(dict.fromkeys(to_persist)))
 
     def _drop_superseded(self) -> int:
-        """Evict superseded checkpoint pages from L1 before any LRU victim."""
+        """Evict stale superseded checkpoint pages from L1 before LRU victims.
+
+        Superseded checkpoints that lose their last page copy this way are
+        retired from the directory before the pages are deleted.
+        """
         retention = self._retention
         if retention is None:
             return 0
-        victims = [
-            key
-            for key in retention.superseded_keys()
-            if self._l1_manager.is_key_evictable(key)
-        ][:_SUPERSEDED_DROP_BATCH]
+        victims: list[ObjectKey] = []
+        for key in retention.take_droppable_superseded():
+            if self._l1_manager.is_key_evictable(key):
+                victims.append(key)
+                if len(victims) >= _SUPERSEDED_DROP_BATCH:
+                    break
         if not victims:
             return 0
+        retention.retire_before_l1_delete(victims)
         result = self._l1_manager.delete(victims)
         dropped = sum(1 for error in result.values() if error == L1Error.SUCCESS)
         retention.record_l1_superseded_drops(dropped)
         return dropped
+
+    def _discard(self, keys: list[ObjectKey]) -> None:
+        """Delete ``keys`` from L1 without an L2 write.
+
+        Superseded checkpoints whose last page copy this deletes are retired
+        from the directory first.
+        """
+        if self._retention is not None:
+            self._retention.retire_before_l1_delete(keys)
+        self._l1_manager.delete(keys)
 
     def request_immediate_eviction(self) -> None:
         """Wake the eviction loop for a capacity-blocked store."""
@@ -488,13 +504,13 @@ class L1EvictionController(EvictionController):
             else:
                 logger.error("L2 eviction destination requires writeback")
                 logger.error("Treating it as DISCARD.")
-                self._l1_manager.delete(action.keys)
+                self._discard(action.keys)
         elif action.destination == EvictionDestination.DISCARD:
-            self._l1_manager.delete(action.keys)
+            self._discard(action.keys)
         else:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
-            self._l1_manager.delete(action.keys)
+            self._discard(action.keys)
 
     def emergency_evict_bytes(
         self,
@@ -895,7 +911,7 @@ class L2EvictionController(StorageControllerInterface):
         self._retention = retention
 
     def _evict_superseded(self, state: L2AdapterEvictionState) -> bool:
-        """Delete superseded checkpoint pages first; return True if any went."""
+        """Delete stale superseded checkpoint pages first; True if any went."""
         retention = self._retention
         if retention is None:
             return False
@@ -907,7 +923,7 @@ class L2EvictionController(StorageControllerInterface):
         if not victims:
             return False
         self._execute_eviction_action(
-            state.adapter,
+            state,
             EvictionAction(keys=victims, destination=EvictionDestination.DISCARD),
         )
         retention.record_l2_superseded_evictions(len(victims), size)
@@ -1035,7 +1051,7 @@ class L2EvictionController(StorageControllerInterface):
                 return
         actions = state.eviction_policy.get_eviction_actions(eviction_ratio)
         for action in actions:
-            self._execute_eviction_action(state.adapter, action)
+            self._execute_eviction_action(state, action)
 
     def _check_and_evict_by_cache_salt(self, state: L2AdapterEvictionState):
         """Per-``cache_salt`` eviction driven by :class:`QuotaManager`.
@@ -1092,19 +1108,22 @@ class L2EvictionController(StorageControllerInterface):
 
         for destination, keys in pending.items():
             self._execute_eviction_action(
-                state.adapter,
+                state,
                 EvictionAction(keys=keys, destination=destination),
             )
 
     def _execute_eviction_action(
-        self, adapter: L2AdapterInterface, action: EvictionAction
+        self, state: L2AdapterEvictionState, action: EvictionAction
     ):
-        if action.destination == EvictionDestination.DISCARD:
-            adapter.delete(action.keys)
-        else:
+        adapter = state.adapter
+        if action.destination != EvictionDestination.DISCARD:
             logger.error("Unsupported eviction destination: %s", action.destination)
             logger.error("Treating it as DISCARD.")
-            adapter.delete(action.keys)
+        if self._retention is not None:
+            # Superseded checkpoints losing their last page copy are delisted
+            # before the pages go.
+            self._retention.retire_before_l2_delete(state.adapter_id, action.keys)
+        adapter.delete(action.keys)
 
         if action.keys:
             get_event_bus().publish(

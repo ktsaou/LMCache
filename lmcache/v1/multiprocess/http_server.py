@@ -181,6 +181,9 @@ async def lifespan(app: FastAPI):
     if launcher is not None:
         launcher.stop_plugins()
     get_event_bus().stop()
+    # Engines stopping at the same time may still be storing checkpoints;
+    # serve them for a bounded time before the message queue closes.
+    engine.drain_for_shutdown()
     if hasattr(app.state, "zmq_server") and app.state.zmq_server is not None:
         app.state.zmq_server.close()
     engine.close()

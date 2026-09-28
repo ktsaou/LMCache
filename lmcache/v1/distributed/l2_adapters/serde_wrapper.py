@@ -316,6 +316,10 @@ class SerdeL2AdapterWrapper(L2AdapterInterface):
         """Forward the persistent inventory owned by the inner adapter."""
         return self._inner.get_existing_key_sizes()
 
+    def absent_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Forward the absence check to the inner adapter, which holds the keys."""
+        return self._inner.absent_keys(keys)
+
     def delete(self, keys: list[ObjectKey]) -> None:
         self._inner.delete(keys)
 

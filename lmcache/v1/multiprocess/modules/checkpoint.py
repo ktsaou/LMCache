@@ -6,6 +6,7 @@ from collections import OrderedDict
 from pathlib import Path
 import json
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -43,6 +44,15 @@ _MAX_TRACKED_REQUESTS = 65536
 # L1, which holds far fewer checkpoints.
 _PERSISTENT_INDEX_MAX_ENTRIES = 65536
 _RAM_INDEX_MAX_ENTRIES = 8192
+# Candidates a lookup may retire because no tier holds their pages any more
+# before it gives up; each is one directory query and one residency check.
+_MAX_LOOKUP_RETIREMENTS = 256
+# While the server stops: with no store in flight, how long to wait after the
+# last store RPC for a straggler (a request finishing as the engine stops
+# begins its last store at once), and with stores in flight, how long without
+# any store RPC before their producer is taken as gone.
+_DRAIN_SETTLE_SECONDS = 0.5
+_DRAIN_IDLE_SECONDS = 3.0
 
 
 def _kind(manifest: CheckpointManifest) -> str | None:
@@ -90,8 +100,10 @@ class CheckpointModule:
             None for 65536 with ``index_path`` and 8192 for a RAM-only
             directory.
 
-    Shutdown requires workers to finish or abort all submitted copy leases.
-    A timeout must not recycle SHM while a worker can still access its bytes.
+    At shutdown, :meth:`drain_stores` gives workers a bounded time to finish
+    or abort their copy leases while the message queue still serves them.
+    A lease left after that makes :meth:`close` raise; its buffers are never
+    recycled while a worker can still access their bytes.
     """
 
     def __init__(
@@ -129,6 +141,11 @@ class CheckpointModule:
         self._lineage_lock = threading.Lock()
         self._request_generations: OrderedDict[str, list[str]] = OrderedDict()
         self._generation_request: dict[str, str] = {}
+        # Monotonic time of the last store RPC, for the shutdown drain.
+        self._last_store_activity = 0.0
+        ctx.storage_manager.checkpoint_retention.set_retirement(
+            self._retire_generations
+        )
 
     @property
     def context(self) -> MPCacheServerContext:
@@ -172,27 +189,68 @@ class CheckpointModule:
         changed or already published generation raises ValueError.
         """
         checkpoint_page_groups(manifest)
+        self._last_store_activity = time.monotonic()
         return self._index.begin(manifest)
 
     def find(self, prefixes: tuple[CheckpointPrefix, ...]) -> CheckpointManifest | None:
         """Return the longest complete candidate for authenticated prefix roots.
 
         A candidate is not a cache hit until all payload ranks restore it.
-        Every rank's payload pages are refreshed in L1 and L2 eviction order:
-        a resumed conversation is often served from the engine's own cache,
-        so its pages are neither read nor rewritten, and its oldest pages,
-        which every later checkpoint of the conversation needs, would
-        otherwise keep the recency of their first write.
+        A listed candidate whose pages no tier holds any more (dropped,
+        evicted or deleted since it was published, or not written before a
+        restart) is retired from the directory, and the next shorter one is
+        tried at once. This needs L2 adapters whose inventory is complete;
+        otherwise the restore validates the pages.
+
+        Every rank's payload pages of the returned candidate are refreshed in
+        L1 and L2 eviction order: a resumed conversation is often served from
+        the engine's own cache, so its pages are neither read nor rewritten,
+        and its oldest pages, which every later checkpoint of the
+        conversation needs, would otherwise keep the recency of their first
+        write. A superseded candidate becomes current again: a request is
+        continuing from it.
         """
-        manifest = self._index.find(prefixes)
-        if manifest is not None:
+        storage = self._ctx.storage_manager
+        retention = storage.checkpoint_retention
+        retired: list[tuple[int, int, int]] = []
+        found: CheckpointManifest | None = None
+        for _ in range(_MAX_LOOKUP_RETIREMENTS + 1):
+            manifest = self._index.find(prefixes)
+            if manifest is None:
+                break
             try:
                 keys = _payload_keys(manifest)
             except ValueError:
                 # Retrieval rejects the same manifest and invalidates it.
-                return manifest
-            self._ctx.storage_manager.touch_keys(keys)
-        return manifest
+                found = manifest
+                break
+            lost = retention.unavailable_pages(keys)
+            if not lost:
+                storage.touch_keys(keys)
+                if retention.mark_generation_current(manifest.generation, keys):
+                    logger.debug(
+                        "Superseded checkpoint of %d tokens was found again; "
+                        "it is current",
+                        manifest.prefix.num_tokens,
+                    )
+                found = manifest
+                break
+            self._index.invalidate(manifest.generation)
+            retired.append((manifest.prefix.num_tokens, len(lost), len(keys)))
+        if retired:
+            tokens, lost_pages, pages = retired[0]
+            logger.info(
+                "Checkpoint lookup retired %d listed checkpoints whose pages no "
+                "tier holds (longest %d tokens, %d of %d pages lost); %s",
+                len(retired),
+                tokens,
+                lost_pages,
+                pages,
+                f"found one of {found.prefix.num_tokens} tokens"
+                if found is not None
+                else "found none",
+            )
+        return found
 
     def supersede(
         self, prefixes: tuple[CheckpointPrefix, ...], generation: str, request: str
@@ -201,10 +259,14 @@ class CheckpointModule:
 
         Called after ``generation`` is published by ``request``, with the
         roots of the token sequence that produced it. Only a ``prompt``
-        checkpoint supersedes: the complete prompt of a new request replaces
-        every published shorter checkpoint of its sequence that an earlier
-        request produced, together with the other checkpoints of those
-        requests that it has moved past (a response endpoint that the chat
+        checkpoint supersedes. Its longest published ancestor from an earlier
+        request is the checkpoint the new prompt continues from; it stays
+        current, because the new request may be a side request (a title or
+        summary request, a sub-agent fork) while the conversation goes on
+        from the same point later. The other published ancestors of the
+        sequence from earlier requests are superseded: the conversation has
+        moved past them twice. So are the other checkpoints of their requests
+        that the new prompt has moved past (a response endpoint that the chat
         template rewrote, a prefill tail). A checkpoint of such a request
         that is at least as long as the new prompt is kept: the new request
         branched off before it (a retry, or an aborted turn resumed with
@@ -213,9 +275,10 @@ class CheckpointModule:
         which other conversations share, are kept. Pages the new checkpoint
         references are current again.
 
-        Superseded pages are evicted first and are never written to L2 on
-        eviction. Their manifests stay listed, so a request that branches
-        from an older turn can still restore one while its pages last.
+        Superseded pages are never written to L2 while serving. They are
+        evicted first, at once, or after the grace period when a later prompt
+        had continued from their checkpoint. When a superseded page's last
+        copy is deleted, its checkpoints are retired from the directory.
 
         Returns:
             Number of pages newly marked superseded.
@@ -231,20 +294,29 @@ class CheckpointModule:
         retention.mark_current(current_keys)
         if _kind(current) != "prompt":
             return 0
-        victims: dict[str, CheckpointManifest] = {}
-        for ancestor in self._index.ancestors(prefixes, current.prefix.num_tokens):
-            owner = self._request_of(ancestor.generation)
-            if owner == request:
-                continue
-            victims[ancestor.generation] = ancestor
-            for sibling in self._generations_of(owner):
-                if sibling not in victims and sibling != generation:
-                    manifest = self._index.get(sibling)
-                    if (
-                        manifest is not None
-                        and manifest.prefix.num_tokens < current.prefix.num_tokens
-                    ):
-                        victims[sibling] = manifest
+        ancestors = [
+            ancestor
+            for ancestor in self._index.ancestors(prefixes, current.prefix.num_tokens)
+            if self._request_of(ancestor.generation) != request
+        ]
+        if not ancestors:
+            return 0
+        parent = ancestors[-1]
+        retention.mark_continued(parent.generation)
+        retention.mark_generation_current(parent.generation, _payload_keys(parent))
+        victims: dict[str, CheckpointManifest] = {
+            ancestor.generation: ancestor for ancestor in ancestors[:-1]
+        }
+        for ancestor in ancestors:
+            for sibling in self._generations_of(self._request_of(ancestor.generation)):
+                if sibling in victims or sibling in (generation, parent.generation):
+                    continue
+                manifest = self._index.get(sibling)
+                if (
+                    manifest is not None
+                    and manifest.prefix.num_tokens < current.prefix.num_tokens
+                ):
+                    victims[sibling] = manifest
         selected = sorted(
             (
                 victim
@@ -262,10 +334,11 @@ class CheckpointModule:
         if selected:
             logger.debug(
                 "Prompt checkpoint of %d tokens superseded %d older checkpoints "
-                "(%d pages)",
+                "(%d pages); it continues from one of %d tokens",
                 current.prefix.num_tokens,
                 len(selected),
                 marked,
+                parent.prefix.num_tokens,
             )
         return marked
 
@@ -293,6 +366,7 @@ class CheckpointModule:
 
     def abort(self, generation: str) -> bool:
         """Prevent publication; rank copy leases still require explicit finish."""
+        self._last_store_activity = time.monotonic()
         self._index.abort(generation)
         return True
 
@@ -303,6 +377,7 @@ class CheckpointModule:
 
         Invalid layouts, ranks or duplicate active rank stores raise ValueError.
         """
+        self._last_store_activity = time.monotonic()
         admission = self._payloads.prepare_store(manifest, rank)
         if admission is AdmissionFailure.BUSY:
             return CheckpointLeaseResponse("busy")
@@ -314,7 +389,11 @@ class CheckpointModule:
 
     def finish_store(self, lease_id: str, success: bool) -> bool:
         """Finish drained D2H work; True means all ranks published the manifest."""
-        return self._payloads.finish_store(lease_id, success)
+        self._last_store_activity = time.monotonic()
+        try:
+            return self._payloads.finish_store(lease_id, success)
+        finally:
+            self._last_store_activity = time.monotonic()
 
     def begin_retrieve(
         self, manifest: CheckpointManifest, rank: int
@@ -364,13 +443,91 @@ class CheckpointModule:
             }
         }
 
+    def drain_stores(self, deadline: float) -> None:
+        """Keep serving checkpoint stores until they settle or ``deadline``.
+
+        Call it when the server starts to stop, while its message queue still
+        serves requests. An engine stopping at the same time may still be
+        copying its last checkpoints; each rank that finishes publishes them,
+        so the shutdown flush can write them to L2.
+
+        Returns once no store lease or unpublished generation remains and no
+        store RPC arrived for a short settle time, once no store RPC arrived
+        for a few seconds while stores are still in flight (their producer is
+        gone), or at ``deadline``. New stores are admitted meanwhile.
+
+        Args:
+            deadline: Monotonic time at which to stop waiting.
+        """
+        start = time.monotonic()
+        announced = False
+        while True:
+            now = time.monotonic()
+            in_flight = (
+                self._payloads.report_status()["store_leases"]
+                + self._index.pending_count()
+            )
+            quiet = now - self._last_store_activity
+            if (
+                (not in_flight and quiet >= _DRAIN_SETTLE_SECONDS)
+                or quiet >= _DRAIN_IDLE_SECONDS
+                or now >= deadline
+            ):
+                break
+            if not announced:
+                announced = True
+                logger.info(
+                    "Serving checkpoint stores for up to %.1f s before shutdown "
+                    "(%d in flight)",
+                    max(0.0, deadline - now),
+                    in_flight,
+                )
+            time.sleep(0.02)
+        if in_flight:
+            logger.warning(
+                "%d checkpoint stores were still in flight after %.1f s of "
+                "shutdown; those checkpoints stay unpublished",
+                in_flight,
+                time.monotonic() - start,
+            )
+        elif announced:
+            logger.info(
+                "Checkpoint stores settled after %.1f s of shutdown",
+                time.monotonic() - start,
+            )
+
+    def _retire_generations(self, generations: list[str]) -> None:
+        """Delist superseded checkpoints whose last page copy is being deleted."""
+        try:
+            self._index.retire(generations)
+        except Exception:
+            # The directory may already be closed during shutdown; a listed
+            # checkpoint without pages is retired by the next lookup instead.
+            logger.debug("Could not retire %d checkpoints", len(generations))
+            return
+        logger.debug(
+            "Retired %d superseded checkpoints whose last pages left the cache",
+            len(generations),
+        )
+
     def close(self) -> None:
         """Close the directory after copy leases drain, otherwise raise RuntimeError.
 
         This module never frees buffers solely because a copy took too long.
-        The owning process shutdown must coordinate GPU worker termination.
+        The owning process shutdown must coordinate GPU worker termination:
+        :meth:`drain_stores` gives workers a bounded time first, and
+        ``MPCacheServer.close`` logs this error and still closes the storage
+        manager, so its shutdown flush runs and its shared memory is released
+        without reusing a lease's buffers.
         """
         status = self._payloads.report_status()
         if status["store_leases"] or status["retrieve_leases"]:
-            raise RuntimeError("Checkpoint worker copy leases must drain before close")
+            raise RuntimeError(
+                f"Checkpoint worker copy leases must drain before close "
+                f"({status['store_leases']} store, "
+                f"{status['retrieve_leases']} retrieve)"
+            )
+        self._ctx.storage_manager.checkpoint_retention.clear_retirement(
+            self._retire_generations
+        )
         self._index.close()

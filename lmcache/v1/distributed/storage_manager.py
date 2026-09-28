@@ -77,6 +77,9 @@ from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
 
+# Seconds between progress lines of the shutdown checkpoint flush.
+_FLUSH_PROGRESS_SECONDS = 2.0
+
 
 class StorageManager:
     def __init__(self, config: StorageManagerConfig):
@@ -118,10 +121,15 @@ class StorageManager:
         self._checkpoint_shutdown_flush_seconds = (
             config.checkpoint_shutdown_flush_seconds
         )
+        # Monotonic deadline of the shutdown drain and flush; 0 until started.
+        self._shutdown_deadline = 0.0
         self._checkpoint_retention = CheckpointRetention(
             write_on_evict=store_policy.writes_checkpoints_on_evict(),
             persist_timeout=config.checkpoint_write_timeout_seconds,
+            supersede_grace_seconds=config.checkpoint_supersede_grace_seconds,
         )
+        self._checkpoint_retention.set_l1_lookup(self._l1_manager.get_present_keys)
+        self._checkpoint_retention.set_l2_absence(self._absent_from_l2)
 
         # L1 eviction controller
         self._eviction_controller = L1EvictionController(
@@ -612,19 +620,58 @@ class StorageManager:
                 adapter_id, list(inventory), list(inventory.values())
             )
 
-    def _flush_current_checkpoints(self) -> None:
+    def _absent_from_l2(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return the keys every L2 adapter confirms it does not hold."""
+        absent = keys
+        for _adapter_id, _descriptor, adapter in self._snapshot_adapters():
+            if not absent:
+                break
+            try:
+                confirmed = set(adapter.absent_keys(absent))
+            except Exception:
+                logger.exception("L2 absence check failed; assuming keys present")
+                return []
+            absent = [key for key in absent if key in confirmed]
+        return absent
+
+    def start_shutdown(self) -> float:
+        """Start the clean-shutdown budget for checkpoint work.
+
+        The budget (``checkpoint_shutdown_flush_seconds``) covers waiting for
+        checkpoint stores still in flight and then writing checkpoint pages
+        that are only in L1 to L2. Idempotent.
+
+        Returns:
+            The monotonic deadline of the budget.
+        """
+        if not self._shutdown_deadline:
+            self._shutdown_deadline = (
+                time.monotonic() + self._checkpoint_shutdown_flush_seconds
+            )
+        return self._shutdown_deadline
+
+    def _flush_current_checkpoints(self, deadline: float) -> None:
         """Write checkpoint pages still only in L1 to L2 on shutdown.
 
-        Current pages go first. Superseded pages follow within the same
-        budget: while serving they leave L1 without a write to spare flash,
-        but a shutdown writes each at most once, and their manifests stay
-        listed, so a request that continues an older line after the restart
-        (a branch, a resumed turn, a side request that extended the
-        conversation) restores instead of finding its pages gone.
+        Current pages go first, then superseded pages still in their grace
+        period, then stale superseded pages, all within the same deadline:
+        while serving, superseded pages leave L1 without a write to spare
+        flash, but a shutdown writes each at most once, and their manifests
+        stay listed, so a request that continues an older line after the
+        restart (a branch, a resumed turn, a side request that extended the
+        conversation) restores instead of finding its pages gone. Progress is
+        logged every few seconds, so a flush cut short by SIGKILL still says
+        how far it got.
+
+        Args:
+            deadline: Monotonic time at which the flush gives up.
         """
         retention = self._checkpoint_retention
-        budget = self._checkpoint_shutdown_flush_seconds
-        if not retention.write_on_evict or budget <= 0 or not self._has_l2_adapters():
+        if (
+            not retention.write_on_evict
+            or not self._checkpoint_shutdown_flush_seconds
+            or not self._has_l2_adapters()
+        ):
             return
         count = self._l1_manager.num_objects()
         keys, _ = self._l1_manager.get_evictable_keys(limit=count, scan_limit=count)
@@ -633,31 +680,50 @@ class StorageManager:
             for key in keys
             if is_recurrent_checkpoint_key(key) and not retention.is_l2_resident(key)
         ]
-        current = [key for key in unwritten if not retention.is_superseded(key)]
-        superseded = [key for key in unwritten if retention.is_superseded(key)]
-        pending = current + superseded
+        superseded = set(retention.superseded_keys())
+        current = [key for key in unwritten if key not in superseded]
+        stale = set(retention.take_droppable_superseded())
+        in_grace = [key for key in unwritten if key in superseded and key not in stale]
+        old = [key for key in unwritten if key in superseded and key in stale]
+        pending = current + in_grace + old
         if not pending:
             return
+        start = time.monotonic()
         logger.info(
             "Writing %d current and %d superseded checkpoint pages to L2 before "
-            "shutdown (budget %.0f s)",
+            "shutdown (%.1f s left)",
             len(current),
-            len(superseded),
-            budget,
+            len(in_grace) + len(old),
+            max(0.0, deadline - start),
         )
-        start = time.monotonic()
-        retention.request_persist(pending)
-        while time.monotonic() - start < budget:
+        if retention.request_persist(pending) < len(pending):
+            # Writes requested while serving may have failed; the store
+            # controller skips the ones still in flight.
+            self._store_controller.submit_reused_keys(pending)
+        last_report = start
+        while True:
             pending = [key for key in pending if not retention.is_l2_resident(key)]
-            if not pending:
+            now = time.monotonic()
+            if not pending or now >= deadline:
                 break
-            time.sleep(0.2)
+            if now - last_report >= _FLUSH_PROGRESS_SECONDS:
+                last_report = now
+                logger.info(
+                    "Shutdown checkpoint flush: %d pages left after %.1f s",
+                    len(pending),
+                    now - start,
+                )
+            time.sleep(0.05)
         if pending:
+            left = set(pending)
             logger.warning(
-                "Shutdown checkpoint flush left %d pages without an L2 copy "
-                "after %.0f s",
+                "Shutdown checkpoint flush left %d pages without an L2 copy after "
+                "%.1f s (%d current, %d superseded); after the restart, lookups "
+                "retire the checkpoints that need them and fall back to shorter ones",
                 len(pending),
                 time.monotonic() - start,
+                sum(1 for key in current if key in left),
+                sum(1 for key in in_grace + old if key in left),
             )
         else:
             logger.info(
@@ -1035,6 +1101,7 @@ class StorageManager:
                 and the number refused because they were locked (non-force only).
                 Missing keys are a no-op, so the operation is idempotent.
         """
+        self._checkpoint_retention.retire_before_l1_delete(keys)
         results = self._l1_manager.delete(keys, force=force)
         deleted = sum(1 for err in results.values() if err == L1Error.SUCCESS)
         skipped = sum(1 for err in results.values() if err == L1Error.KEY_IS_LOCKED)
@@ -1390,14 +1457,20 @@ class StorageManager:
                 If False (default), only clear unlocked objects, keeping
                 write-locked and read-locked objects intact.
         """
+        retention = self._checkpoint_retention
+        retention.retire_before_l1_delete(retention.superseded_keys())
         self._l1_manager.clear(force=force)
 
     def close(self):
         """
         Close the storage manager and release all resources.
+
+        With write-on-evict checkpoint storage, checkpoint pages still only
+        in L1 are first written to L2 within what is left of the budget that
+        :meth:`start_shutdown` started (it starts here if nothing did).
         """
         try:
-            self._flush_current_checkpoints()
+            self._flush_current_checkpoints(self.start_shutdown())
         except Exception:
             logger.exception("Shutdown checkpoint flush failed")
         self._l1_manager.begin_shutdown()
