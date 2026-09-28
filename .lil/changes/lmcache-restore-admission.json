@@ -1,0 +1,30 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-restore-admission",
+  "category": "fix",
+  "summary": "Recurrent checkpoint restores wait for GPU and copy capacity instead of admitting requests to recompute cached prefixes.",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "Waiting needs the paired vLLM restore-admission change. With an older vLLM, LMCache logs one warning at startup and keeps the previous behavior: a restore without enough free GPU blocks or copy slots is admitted and its prompt is recomputed.",
+  "details": [
+    "A waiting restore keeps its directory answer; the wait does not count against lmcache.mp.mq_timeout. It is logged when it starts and every 30 s with its age and what it waits for: free GPU blocks against the blocks its checkpoint needs, or copies in flight.",
+    "lmcache.mp.mq_timeout now limits each directory reply separately, including each retry after a failed restore, instead of all lookups of a request together: a request whose restores fail three times can wait up to four times mq_timeout for replies.",
+    "A restore waiting longer than half of lmcache.mp.mq_timeout sends its lookup again, which keeps the checkpoint's pages recent in RAM and disk eviction order. Its answer replaces the kept one; if the directory lists no checkpoint of the prompt any more, the prompt is recomputed.",
+    "A checkpoint chosen before admission is looked up again only if the GPU cache no longer holds one at least as long; a longer local checkpoint that appears meanwhile is used without a lookup.",
+    "A request whose complete prompt is cached on the GPU is admitted without waiting for the directory, unless its own restore copy is in flight.",
+    "Genuine misses and exhausted restore retries still recompute the prompt. This change does not repair missing checkpoint pages in cache storage."
+  ],
+  "requires": [
+    "vllm-restore-admission"
+  ],
+  "pull_requests": [
+    100,
+    103
+  ],
+  "authors": [
+    "ktsaou",
+    "Local Inference Lab"
+  ]
+}
