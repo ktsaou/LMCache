@@ -1,0 +1,23 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-102",
+  "category": "fix",
+  "summary": "Conversations that continue after a retry or an aborted turn restore instead of losing 8 state pages",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required.",
+  "details": [
+    "A request that branched off an earlier turn (a retry, an aborted turn resumed with other tokens, an auto-continue) marked that turn's longer response checkpoint as superseded. Its recurrent-state pages were then dropped under L1 pressure or skipped at shutdown while the checkpoint stayed listed, so the turn that continued it logged 'K of M pages were readable' (the 8 state pages missing) and recomputed the whole prompt.",
+    "A sibling checkpoint is now superseded only when the new prompt is longer than it, meaning the conversation moved past it. Older checkpoints on the new prompt's own path are still superseded, so on-evict keeps its flash-write savings.",
+    "A clean shutdown writes superseded pages after the current ones within the same flush budget, so branches restore after a restart."
+  ],
+  "pull_requests": [
+    102
+  ],
+  "evidence": [
+    "https://github.com/mrweiner/lmcache-supersession-repro"
+  ],
+  "requires": []
+}
