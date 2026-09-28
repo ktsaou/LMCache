@@ -8,6 +8,7 @@ from multiprocessing import shared_memory
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
+import inspect
 import json
 import os
 import time
@@ -52,6 +53,7 @@ from lmcache.integration.vllm.recurrent_checkpoint_connector import (  # noqa: E
     RecurrentCheckpointMetadata,
     RecurrentCheckpointWorkerMetadata,
 )
+from lmcache.v1.multiprocess.checkpoint_index import CheckpointManifest  # noqa: E402
 from lmcache.v1.multiprocess.checkpoint_storage import (  # noqa: E402
     checkpoint_object_keys,
 )
@@ -72,6 +74,20 @@ from tests.v1.multiprocess.test_checkpoint_storage import (  # noqa: E402
 pytestmark = pytest.mark.skipif(
     not hasattr(KVCacheManager, "reserve_external_boundary_checkpoint"),
     reason="vLLM requires the atomic boundary import allocator API",
+)
+
+# vLLM before the paired restore-admission change cannot reserve admission
+# capacity for a restore; the bridge then keeps its earlier fallback, which
+# admits a restore without enough free GPU blocks to recompute its prompt.
+_reserve = getattr(KVCacheManager, "reserve_external_boundary_checkpoint", None)
+RESTORE_ADMISSION = (
+    _reserve is not None
+    and hasattr(KVCacheManager, "release_external_boundary_admission")
+    and "reserve_admission" in inspect.signature(_reserve).parameters
+)
+requires_restore_admission = pytest.mark.skipif(
+    not RESTORE_ADMISSION,
+    reason="vLLM cannot reserve admission capacity for checkpoint restores",
 )
 
 
@@ -294,13 +310,13 @@ def test_lora_requests_do_not_read_or_publish_the_base_weight_namespace() -> Non
         )
 
 
-def make_request(name: str, *, first_token: int = 0) -> Request:
-    """Construct an exact eleven-token prompt with ordinary cache authentication."""
+def make_request(name: str, *, first_token: int = 0, num_tokens: int = 11) -> Request:
+    """Construct an exact prompt, eleven tokens by default, with cache hashes."""
     params = SamplingParams(max_tokens=1)
     params.update_from_generation_config({}, eos_token_id=100)
     return Request(
         request_id=name,
-        prompt_token_ids=list(range(first_token, first_token + 11)),
+        prompt_token_ids=list(range(first_token, first_token + num_tokens)),
         sampling_params=params,
         pooling_params=None,
         block_hasher=get_request_block_hasher(4, sha256),
@@ -486,10 +502,10 @@ def test_worker_metadata_requires_bound_rank() -> None:
         "rejected-store-reused-request-id",
         "inflight-store-reused-request-id",
         "capacity-retry",
-        "capacity-timeout",
-        "task-capacity",
-        "local-hit-during-copy",
-        "invalidated-before-use",
+        pytest.param("capacity-timeout", marks=requires_restore_admission),
+        pytest.param("task-capacity", marks=requires_restore_admission),
+        pytest.param("local-hit-during-copy", marks=requires_restore_admission),
+        pytest.param("invalidated-before-use", marks=requires_restore_admission),
         "publication-invalidated",
     ],
 )
@@ -600,16 +616,28 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
             assert sum(len(root.tail_tokens) for root in roots) >= prefix.num_tokens
             consumer = make_request("consumer")
             if outcome in ("capacity-retry", "capacity-timeout"):
-                # Resource pressure must not authorize cold admission.
                 pressure = manager.block_pool.get_new_blocks(
                     manager.block_pool.get_num_free_blocks()
                 )
                 try:
-                    for _ in range(100):
+                    if RESTORE_ADMISSION:
+                        # Resource pressure must not authorize cold admission,
+                        # even after the lookup deadline has passed.
+                        for _ in range(100):
+                            assert not bridge.poll_prefix(consumer)
+                            time.sleep(0.001)
+                        assert bridge.take_tasks() == []
                         assert not bridge.poll_prefix(consumer)
-                        time.sleep(0.001)
-                    assert bridge.take_tasks() == []
-                    assert not bridge.poll_prefix(consumer)
+                    else:
+                        # Without reservations, ordinary admission may proceed,
+                        # and the manifest stays retryable until this consumer
+                        # is admitted or cancelled.
+                        deadline = time.monotonic() + 5
+                        while not bridge.poll_prefix(consumer):
+                            assert time.monotonic() < deadline
+                            time.sleep(0.001)
+                        assert bridge.take_tasks() == []
+                        assert bridge.poll_prefix(consumer)
                 finally:
                     manager.block_pool.free_blocks(pressure)
             inflight_store = None
@@ -703,33 +731,46 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                 manager.boundary_checkpoints.invalidate_block(
                     restore_task.block_ids[-1][0]
                 )
-            for rank in range(4):
-                future = worker.submit(
-                    CheckpointTransferJob(
-                        restore_task.manifest,
-                        rank,
-                        "RETRIEVE",
-                        restore_task.block_ids,
+            messages: list[str] = []
+            with monkeypatch.context() as logs:
+                logs.setattr(
+                    checkpoint_scheduler.logger,
+                    "info",
+                    lambda message, *args: messages.append(message),
+                )
+                for rank in range(4):
+                    future = worker.submit(
+                        CheckpointTransferJob(
+                            restore_task.manifest,
+                            rank,
+                            "RETRIEVE",
+                            restore_task.block_ids,
+                        )
                     )
-                )
-                assert future is not None and future.result(timeout=5)
-                bridge.complete(
-                    {
-                        restore_task.task_id: {
-                            rank: not (outcome == "rank-miss" and rank == 2)
+                    assert future is not None and future.result(timeout=5)
+                    bridge.complete(
+                        {
+                            restore_task.task_id: {
+                                rank: not (outcome == "rank-miss" and rank == 2)
+                            }
                         }
-                    }
-                )
-                if rank < 3:
-                    if outcome != "local-hit-during-copy":
-                        assert manager.get_computed_blocks(consumer)[1] == 0
-                    assert manager.block_pool.get_num_free_blocks() < before
+                    )
+                    if rank < 3:
+                        if outcome != "local-hit-during-copy":
+                            assert manager.get_computed_blocks(consumer)[1] == 0
+                        assert manager.block_pool.get_num_free_blocks() < before
+            if outcome == "publication-invalidated":
+                # Local eviction is not a directory miss; the retry may find
+                # the same checkpoint rather than a shorter one.
+                assert any("invalidated before publication" in m for m in messages)
+                assert not any("missed" in m for m in messages)
             expected_tokens = (
                 0
                 if outcome in ("rank-miss", "cancelled", "publication-invalidated")
                 else 11
             )
-            if expected_tokens:
+            if expected_tokens and RESTORE_ADMISSION:
+                # The consumer owns its published restore until admission.
                 assert manager.block_pool.get_num_free_blocks() < before
                 assert not manager.reset_prefix_cache()
             else:
@@ -747,6 +788,7 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
                 assert not bridge.poll_prefix(consumer)
             bridge.finish_request(consumer.request_id)
             assert manager.block_pool.get_num_free_blocks() == before
+            assert_restore_queue_empty(manager)
             if inflight_store is not None:
                 drain_predecessor()
             assert not bridge.has_pending
@@ -868,11 +910,15 @@ def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None
             assert manager.get_computed_blocks(consumer)[1] == 8
             assert bridge.external_tokens(consumer) == 8
             assert not bridge.has_pending
+            bridge.finish_request(consumer.request_id)
+            assert_restore_queue_empty(manager)
         finally:
             worker.close()
 
 
-def make_bridge(client, manager, lookup_timeout: float) -> CheckpointSchedulerBridge:
+def make_bridge(
+    client, manager, lookup_timeout: float, *, max_tasks: int = 32
+) -> CheckpointSchedulerBridge:
     """Bridge with negotiated layouts and a short directory reply deadline."""
     bridge = CheckpointSchedulerBridge(
         manager,
@@ -884,6 +930,7 @@ def make_bridge(client, manager, lookup_timeout: float) -> CheckpointSchedulerBr
             "parallel": {"tp": 4, "dcp": 1},
         },
         4,
+        max_tasks=max_tasks,
         lookup_timeout=lookup_timeout,
     )
     bridge.accept_layouts(
@@ -892,6 +939,114 @@ def make_bridge(client, manager, lookup_timeout: float) -> CheckpointSchedulerBr
     return bridge
 
 
+def assert_restore_queue_empty(manager: KVCacheManager) -> None:
+    """No restore reservation or queued restore holds back other admissions."""
+    if RESTORE_ADMISSION:
+        assert manager.can_admit_external_boundary_request("unrelated-request")
+        assert manager.external_boundary_reserved_blocks() == 0
+
+
+class FakeDirectory:
+    """Checkpoint RPC double that lists the last stored manifest.
+
+    ``listed`` and ``replies`` apply to lookups sent after they change.
+    """
+
+    def __init__(self) -> None:
+        self.listed: CheckpointManifest | None = None
+        self.replies = True
+        self.finds = 0
+
+    def submit_request(self, kind: RequestType, args: list[Any]) -> SimpleNamespace:
+        if kind == RequestType.CHECKPOINT_BEGIN:
+            self.listed = args[0]
+        if kind != RequestType.CHECKPOINT_FIND:
+            return SimpleNamespace(query=lambda: True, result=lambda: True)
+        self.finds += 1
+        answered, listed = self.replies, self.listed
+        return SimpleNamespace(query=lambda: answered, result=lambda: listed)
+
+
+class LegacyAllocator:
+    """A real allocator seen through vLLM's API before restore admission.
+
+    Reservations lack ``reserve_admission`` and the admission methods are
+    missing, so any use of them fails the test.
+    """
+
+    missing = (
+        "can_admit_external_boundary_request",
+        "external_boundary_admission_ready",
+        "external_boundary_reserved_blocks",
+        "has_external_boundary_admission",
+        "has_pending_external_boundary_admissions",
+        "release_external_boundary_admission",
+        "set_external_boundary_admission_context",
+    )
+
+    def __init__(self, manager: KVCacheManager) -> None:
+        self.manager = manager
+
+    def __getattr__(self, name: str) -> Any:
+        if name in LegacyAllocator.missing:
+            raise AttributeError(name)
+        return getattr(self.manager, name)
+
+    def reserve_external_boundary_checkpoint(
+        self,
+        request: Request,
+        num_tokens: int,
+        page_positions: tuple[tuple[int, ...], ...],
+        *,
+        draft_prefix_len: int,
+        kind: str,
+        num_ranks: int,
+    ) -> BoundaryCheckpoint | None:
+        return self.manager.reserve_external_boundary_checkpoint(
+            request,
+            num_tokens,
+            page_positions,
+            draft_prefix_len=draft_prefix_len,
+            kind=kind,
+            num_ranks=num_ranks,
+        )
+
+
+def publish_local(
+    manager: KVCacheManager, request: Request, prefix: int
+) -> BoundaryCheckpoint:
+    """Publish a GPU-cached checkpoint of the request's first tokens."""
+    checkpoint = manager.reserve_external_boundary_checkpoint(
+        request,
+        prefix,
+        manager.boundary_checkpoint_page_positions(prefix),
+        draft_prefix_len=prefix,
+        kind="prompt",
+        num_ranks=1,
+    )
+    assert checkpoint is not None
+    assert manager.acknowledge_external_boundary_checkpoint(checkpoint.checkpoint_id, 0)
+    return checkpoint
+
+
+def publish_external(
+    bridge: CheckpointSchedulerBridge,
+    manager: KVCacheManager,
+    prefix: int,
+    *,
+    num_tokens: int = 11,
+) -> Request:
+    """Store a producer's checkpoint and drop every GPU copy of it."""
+    producer = make_request("producer", num_tokens=num_tokens)
+    bridge.store(producer, publish_local(manager, producer, prefix))
+    (store,) = bridge.take_tasks()
+    bridge.complete({store.task_id: {rank: True for rank in range(4)}})
+    bridge.finish_request(producer.request_id)
+    assert manager.reset_prefix_cache()
+    return producer
+
+
+@requires_restore_admission
 @pytest.mark.parametrize("prefix, already_local", [(11, False), (8, True)])
 def test_local_reuse_retries_external_restore_after_capacity_eviction(
     prefix: int, already_local: bool
@@ -989,7 +1144,7 @@ def test_local_reuse_retries_external_restore_after_capacity_eviction(
     bridge.finish_request(consumer.request_id)
     manager.free(consumer)
     assert not bridge.has_pending
-    assert manager.external_boundary_reserved_blocks() == 0
+    assert_restore_queue_empty(manager)
     assert manager.block_pool.get_num_free_blocks() == 63
 
 
@@ -1023,6 +1178,8 @@ def test_lookup_without_a_usable_reply_admits_the_request(
         assert bridge.take_tasks() == []
         assert bridge.external_tokens(consumer) == 0
         assert not bridge.has_pending
+        bridge.finish_request(consumer.request_id)
+        assert_restore_queue_empty(manager)
 
 
 def test_unanswered_store_begin_is_aborted_after_the_timeout(
@@ -1064,3 +1221,355 @@ def test_unanswered_store_begin_is_aborted_after_the_timeout(
         assert submitted == [RequestType.CHECKPOINT_BEGIN, RequestType.CHECKPOINT_ABORT]
         assert not bridge.has_pending
         assert manager.reset_prefix_cache()
+
+
+@pytest.mark.parametrize("api", ["complete", "without-release", "without-parameter"])
+def test_restore_admission_api_is_detected_before_use(api: str) -> None:
+    """Reservation calls reach only a vLLM that has every reservation method."""
+
+    def reserve(
+        request: Request,
+        num_tokens: int,
+        page_positions: tuple[tuple[int, ...], ...],
+        *,
+        draft_prefix_len: int,
+        kind: str,
+        num_ranks: int,
+        reserve_admission: bool = False,
+    ) -> None:
+        return None
+
+    def reserve_before_admission(
+        request: Request,
+        num_tokens: int,
+        page_positions: tuple[tuple[int, ...], ...],
+        *,
+        draft_prefix_len: int,
+        kind: str,
+        num_ranks: int,
+    ) -> None:
+        return None
+
+    released: list[str] = []
+    manager = SimpleNamespace(
+        boundary_checkpoints=SimpleNamespace(),
+        reserve_external_boundary_checkpoint=(
+            reserve_before_admission if api == "without-parameter" else reserve
+        ),
+        can_admit_external_boundary_request=lambda request_id: True,
+        external_boundary_admission_ready=lambda request_id: False,
+    )
+    if api != "without-release":
+        manager.release_external_boundary_admission = released.append
+    with patch.object(checkpoint_scheduler.logger, "warning") as warning:
+        bridge = make_bridge(FakeDirectory(), manager, 60)
+    bridge.finish_request("finished")
+    supported = api == "complete"
+    assert released == (["finished"] if supported else [])
+    assert warning.call_count == (0 if supported else 1)
+
+
+@pytest.mark.parametrize("pressure", ["gpu-blocks", "copy-slots"])
+def test_restores_without_admission_reservations_keep_the_earlier_fallback(
+    pressure: str,
+) -> None:
+    """An older vLLM receives no reservation calls and keeps the prior fallback.
+
+    A restore that finds no free GPU blocks or copy slots is admitted to
+    recompute its prompt; a request still waiting for ordinary admission
+    retries its GPU reservation with the answer it already has.
+    """
+    manager = make_manager()
+    directory = FakeDirectory()
+    with patch.object(checkpoint_scheduler.logger, "warning") as warning:
+        bridge = make_bridge(
+            directory,
+            LegacyAllocator(manager),
+            60,
+            max_tasks=1 if pressure == "copy-slots" else 32,
+        )
+    assert warning.call_count == 1
+    publish_external(bridge, manager, 11)
+    consumer = make_request("consumer")
+    assert not bridge.poll_prefix(consumer)
+    if pressure == "gpu-blocks":
+        blocked = manager.block_pool.get_new_blocks(
+            manager.block_pool.get_num_free_blocks()
+        )
+    else:
+        blocker = make_request("blocker", first_token=20)
+        bridge.store(blocker, publish_local(manager, blocker, 11))
+        (store,) = bridge.take_tasks()
+    with (
+        patch.object(checkpoint_scheduler.logger, "info") as info,
+        patch.object(checkpoint_scheduler.logger, "warning") as warning,
+    ):
+        assert bridge.poll_prefix(consumer)
+        assert bridge.poll_prefix(consumer)
+    # A reservation passing reserve_admission would have been rejected.
+    assert not warning.called
+    (message,) = (call.args[0] for call in info.call_args_list)
+    assert ("deferred" if pressure == "gpu-blocks" else "skipped") in message
+    assert bridge.take_tasks() == []
+    if pressure == "gpu-blocks":
+        manager.block_pool.free_blocks(blocked)
+        assert not bridge.poll_prefix(consumer)
+        (restore,) = bridge.take_tasks()
+        bridge.complete({restore.task_id: {rank: True for rank in range(4)}})
+    else:
+        bridge.complete({store.task_id: {rank: True for rank in range(4)}})
+        bridge.finish_request(blocker.request_id)
+        assert bridge.take_tasks() == []
+    assert bridge.poll_prefix(consumer)
+    assert directory.finds == 1
+    expected = 11 if pressure == "gpu-blocks" else 0
+    assert manager.get_computed_blocks(consumer)[1] == expected
+    assert bridge.external_tokens(consumer) == expected
+    bridge.finish_request(consumer.request_id)
+    assert not bridge.has_pending
+
+
+def test_complete_local_hit_does_not_wait_for_the_directory() -> None:
+    """A full-prompt checkpoint in the GPU cache needs no directory reply."""
+    manager = make_manager()
+    directory = FakeDirectory()
+    directory.replies = False
+    bridge = make_bridge(directory, manager, 60)
+    consumer = make_request("consumer")
+    assert not bridge.poll_prefix(consumer)
+    # A sibling request with the same prompt publishes its checkpoint.
+    publish_local(manager, make_request("sibling"), 11)
+    assert bridge.poll_prefix(consumer)
+    assert manager.get_computed_blocks(consumer)[1] == 11
+    assert bridge.external_tokens(consumer) == 0
+    assert directory.finds == 1
+    # Losing that checkpoint before admission starts a new lookup when vLLM
+    # can reserve restores, instead of resuming the unanswered one.
+    assert manager.reset_prefix_cache()
+    assert not bridge.poll_prefix(consumer)
+    assert directory.finds == (2 if RESTORE_ADMISSION else 1)
+    bridge.finish_request(consumer.request_id)
+    assert_restore_queue_empty(manager)
+
+
+@requires_restore_admission
+def test_longer_local_checkpoint_keeps_the_selection() -> None:
+    """A selected checkpoint superseded by a longer one needs no new lookup."""
+    manager = make_manager()
+    directory = FakeDirectory()
+    bridge = make_bridge(directory, manager, 60)
+    producer = publish_external(bridge, manager, 8, num_tokens=15)
+    consumer = make_request("consumer", num_tokens=15)
+    publish_local(manager, producer, 8)
+    assert not bridge.poll_prefix(consumer)
+    # The local checkpoint is as long as the stored one, so it is selected.
+    assert bridge.poll_prefix(consumer)
+    assert manager.get_computed_blocks(consumer)[1] == 8
+    # Before ordinary admission succeeds, a sibling publishes more tokens.
+    publish_local(manager, producer, 12)
+    with patch.object(checkpoint_scheduler.logger, "info") as info:
+        assert bridge.poll_prefix(consumer)
+    assert not info.called
+    assert directory.finds == 1
+    assert manager.get_computed_blocks(consumer)[1] == 12
+    assert bridge.external_tokens(consumer) == 0
+    bridge.finish_request(consumer.request_id)
+    assert_restore_queue_empty(manager)
+
+
+@requires_restore_admission
+def test_preempted_import_reuses_a_longer_local_checkpoint() -> None:
+    """A preempted import whose prompt now has a longer checkpoint resumes at once.
+
+    The directory is unresponsive, so another lookup would hold the request.
+    """
+    manager = make_manager()
+    directory = FakeDirectory()
+    bridge = make_bridge(directory, manager, 60)
+    producer = publish_external(bridge, manager, 8, num_tokens=15)
+    consumer = make_request("consumer", num_tokens=15)
+    assert not bridge.poll_prefix(consumer)
+    assert not bridge.poll_prefix(consumer)
+    (restore,) = bridge.take_tasks()
+    bridge.complete({restore.task_id: {rank: True for rank in range(4)}})
+    assert bridge.poll_prefix(consumer)
+    blocks, tokens, _ = manager.get_computed_blocks(consumer)
+    assert tokens == 8 and bridge.external_tokens(consumer) == 8
+    assert (
+        manager.allocate_slots(
+            consumer,
+            consumer.num_tokens - tokens,
+            num_new_computed_tokens=tokens,
+            new_computed_blocks=blocks,
+        )
+        is not None
+    )
+    _, copies = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(copies)
+    # While running, the prompt gains a longer checkpoint (as the request's
+    # own prompt capture would publish); then the request is preempted.
+    publish_local(manager, producer, 12)
+    manager.free(consumer)
+    directory.replies = False
+    assert bridge.poll_prefix(consumer)
+    assert directory.finds == 1
+    assert manager.get_computed_blocks(consumer)[1] == 12
+    bridge.finish_request(consumer.request_id)
+    assert_restore_queue_empty(manager)
+
+
+@requires_restore_admission
+def test_capacity_wait_is_logged_periodically_and_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restore starved of GPU blocks stays visible while it waits.
+
+    Its answer is validated once, not on every scheduler step of the wait.
+    """
+    monkeypatch.setattr(checkpoint_scheduler, "_WAIT_LOG_SECONDS", 0.05)
+    parsed: list[CheckpointManifest] = []
+    page_groups = checkpoint_scheduler.checkpoint_page_groups
+
+    def parse(manifest: CheckpointManifest) -> Any:
+        parsed.append(manifest)
+        return page_groups(manifest)
+
+    monkeypatch.setattr(checkpoint_scheduler, "checkpoint_page_groups", parse)
+    manager = make_manager()
+    bridge = make_bridge(FakeDirectory(), manager, 60)
+    publish_external(bridge, manager, 11)
+    consumer = make_request("consumer")
+    assert not bridge.poll_prefix(consumer)
+    pressure = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks()
+    )
+    with patch.object(checkpoint_scheduler.logger, "info") as info:
+        for _ in range(10):
+            assert not bridge.poll_prefix(consumer)
+        time.sleep(0.06)
+        assert not bridge.poll_prefix(consumer)
+    started, repeated = (call.args for call in info.call_args_list)
+    assert "is waiting for GPU capacity" in started[0]
+    # Tokens, request, free blocks, and blocks the checkpoint alone needs.
+    assert started[1:4] == (11, consumer.request_id, 0)
+    assert started[4] > 0
+    assert "has waited" in repeated[0]
+    assert repeated[1:3] == (11, consumer.request_id)
+    assert repeated[3] >= 0.05
+    assert repeated[4:] == started[3:]
+    status = bridge.report_status()
+    assert status["capacity_waits"] == 1
+    assert status["longest_capacity_wait_seconds"] >= 0.05
+    assert status["capacity_waits_started"] == 1
+    manager.block_pool.free_blocks(pressure)
+    with patch.object(checkpoint_scheduler.logger, "info") as info:
+        assert not bridge.poll_prefix(consumer)
+    (resumed,) = (call.args for call in info.call_args_list)
+    assert "starts after waiting" in resumed[0]
+    assert bridge.report_status()["capacity_waits"] == 0
+    (restore,) = bridge.take_tasks()
+    bridge.complete({restore.task_id: {rank: True for rank in range(4)}})
+    assert bridge.poll_prefix(consumer)
+    assert bridge.external_tokens(consumer) == 11
+    assert len(parsed) == 1
+    bridge.finish_request(consumer.request_id)
+    assert_restore_queue_empty(manager)
+    assert bridge.report_status() == {
+        "capacity_waits": 0,
+        "longest_capacity_wait_seconds": 0.0,
+        "capacity_waits_started": 1,
+    }
+
+
+@requires_restore_admission
+@pytest.mark.parametrize(
+    "exit_path",
+    ["finished", "restored", "local-covers", "complete-local", "unlisted", "rejected"],
+)
+def test_capacity_waiter_leaves_the_restore_queue(exit_path: str) -> None:
+    """Every way out of a capacity wait lets other requests be admitted."""
+    manager = make_manager()
+    directory = FakeDirectory()
+    bridge = make_bridge(directory, manager, 0.2)
+    producer = publish_external(bridge, manager, 8)
+    consumer = make_request("consumer")
+    assert not bridge.poll_prefix(consumer)
+    pressure = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks()
+    )
+    assert not bridge.poll_prefix(consumer)
+    assert bridge.report_status()["capacity_waits"] == 1
+    if exit_path == "finished":
+        bridge.finish_request(consumer.request_id)
+    elif exit_path == "restored":
+        manager.block_pool.free_blocks(pressure)
+        pressure = []
+        assert not bridge.poll_prefix(consumer)
+        (restore,) = bridge.take_tasks()
+        bridge.complete({restore.task_id: {rank: True for rank in range(4)}})
+        assert bridge.poll_prefix(consumer)
+    elif exit_path in ("local-covers", "complete-local"):
+        prefix = 8 if exit_path == "local-covers" else 11
+        pages = sum(map(len, manager.boundary_checkpoint_page_positions(prefix))) + 1
+        manager.block_pool.free_blocks(pressure[:pages])
+        pressure = pressure[pages:]
+        publish_local(manager, producer, prefix)
+        assert bridge.poll_prefix(consumer)
+        assert manager.get_computed_blocks(consumer)[1] == prefix
+    else:
+        # A lookup re-sent during the wait finds the checkpoint gone, or
+        # finds one this engine cannot restore.
+        assert directory.listed is not None
+        directory.listed = (
+            None
+            if exit_path == "unlisted"
+            else replace(directory.listed, generation="other-layout", world_size=2)
+        )
+        time.sleep(0.11)
+        assert not bridge.poll_prefix(consumer)
+        assert directory.finds == 2
+        assert bridge.poll_prefix(consumer)
+        assert bridge.take_tasks() == []
+    assert manager.can_admit_external_boundary_request("unrelated-request")
+    assert bridge.report_status()["capacity_waits"] == 0
+    manager.block_pool.free_blocks(pressure)
+    bridge.finish_request(consumer.request_id)
+    assert_restore_queue_empty(manager)
+    assert not bridge.has_pending
+
+
+@requires_restore_admission
+def test_waiting_restore_refreshes_its_lookup_without_blocking() -> None:
+    """A long capacity wait sends its lookup again but never waits for it.
+
+    The lookup refreshes the eviction recency of the checkpoint's pages.
+    """
+    manager = make_manager()
+    directory = FakeDirectory()
+    bridge = make_bridge(directory, manager, 0.2)
+    publish_external(bridge, manager, 11)
+    consumer = make_request("consumer")
+    assert not bridge.poll_prefix(consumer)
+    pressure = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks()
+    )
+    assert not bridge.poll_prefix(consumer)
+    assert not bridge.poll_prefix(consumer)
+    assert directory.finds == 1
+    time.sleep(0.11)
+    # Half the reply deadline has passed; this re-sent lookup is never answered.
+    directory.replies = False
+    assert not bridge.poll_prefix(consumer)
+    assert directory.finds == 2
+    time.sleep(0.11)
+    assert not bridge.poll_prefix(consumer)
+    assert directory.finds == 2
+    # Capacity starts the restore from the retained answer, beyond the deadline.
+    manager.block_pool.free_blocks(pressure)
+    assert not bridge.poll_prefix(consumer)
+    (restore,) = bridge.take_tasks()
+    bridge.complete({restore.task_id: {rank: True for rank in range(4)}})
+    assert bridge.poll_prefix(consumer)
+    assert bridge.external_tokens(consumer) == 11
+    bridge.finish_request(consumer.request_id)
+    assert_restore_queue_empty(manager)
