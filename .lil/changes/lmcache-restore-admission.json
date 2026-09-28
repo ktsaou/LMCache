@@ -20,6 +20,11 @@
     "vllm-restore-admission"
   ],
   "pull_requests": [
-    100
+    100,
+    103
+  ],
+  "authors": [
+    "ktsaou",
+    "Local Inference Lab"
   ]
 }
