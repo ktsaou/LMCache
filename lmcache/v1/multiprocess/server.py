@@ -574,8 +574,8 @@ def run_cache_server(
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
-        event_bus.stop()
         engine.drain_for_shutdown()
+        event_bus.stop()
         server.close()
         engine.close()
     finally:
