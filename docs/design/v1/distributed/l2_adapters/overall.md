@@ -528,6 +528,15 @@ existing `close()` (to keep data on disk) path. See
 `nixl_store_dynamic_l2_adapter.py` for a reference implementation and
 [`nixl_store.md`](nixl_store.md) for design details.
 
+`absent_keys(keys)` returns the keys an adapter can confirm it does not
+hold, answered synchronously from cheap local state; the default confirms
+nothing. The storage manager treats a recurrent checkpoint page as lost only
+when L1 does not hold it and every adapter confirms it absent, and a
+checkpoint lookup then retires the checkpoints that need it instead of
+offering a restore that fails. The check must see objects that other
+processes sharing the backend wrote: `fs` and `fs_native` stat the object
+files, and the in-process mock checks its dictionary.
+
 ### Native (C++/Rust) Storage Backends
 
 For high-performance backends written in C++ or Rust, use the shared native

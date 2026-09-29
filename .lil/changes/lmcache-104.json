@@ -1,0 +1,25 @@
+{
+  "schema": "local-inference-release-change/v1",
+  "id": "lmcache-104",
+  "category": "fix",
+  "summary": "Conversations restore after a title request or sub-agent fork, lost checkpoints are no longer offered, and a stopping container finishes and writes its last checkpoints",
+  "models": [
+    "Qwen3.8-Flash-Next",
+    "GLM-5.3-Flash"
+  ],
+  "compatibility": "No user action required. New option --checkpoint-supersede-grace-seconds (default 300). --checkpoint-shutdown-flush-seconds now also covers a short wait (at most a third of it and 5 s) for checkpoint stores still in flight when the container stops. Give the container time to stop (docker run --stop-timeout 60 or Compose stop_grace_period: 60s); with Docker's default 10 s the current checkpoints are written first.",
+  "details": [
+    "A request that extends a conversation's latest checkpoint without being its next turn, such as a title, summary or follow-up request, or a sub-agent forked from the conversation, marked that checkpoint as superseded. Under RAM pressure its state pages were dropped without a disk write, and when the user continued, the restore failed with 'K of M pages were readable' and recomputed the prompt. The checkpoint a new prompt continues from now stays current until a later prompt moves past it too, so the next turn restores it. Superseded checkpoints are still never written to disk while serving.",
+    "A fork point that a sub-agent superseded keeps its place in RAM eviction order for 300 s instead of being dropped first, and a lookup that finds it makes it current again.",
+    "A checkpoint is retired from the directory before the last copy of a page it needs is dropped, and a lookup skips and retires checkpoints whose pages no tier holds (evicted from disk, deleted, or not written before a restart). The next shorter checkpoint is restored in the same lookup instead of after a failed restore. Pages that another server sharing the cache directory wrote still count.",
+    "When the container stops, the cache keeps serving the checkpoint stores the model is still copying for a few seconds, then writes checkpoints that are only in RAM, current ones first, and logs what it could not write. Before, a store in flight at that moment made the cache skip the whole shutdown write.",
+    "In a synthetic 12-conversation workload with side requests, failed restores fell from 118-247 per 180 turns to 0. Disk writes grow only where RAM barely holds the active conversations, by at most about one checkpoint per turn."
+  ],
+  "pull_requests": [
+    104
+  ],
+  "evidence": [
+    "https://github.com/mrweiner/lmcache-supersession-repro"
+  ],
+  "requires": []
+}

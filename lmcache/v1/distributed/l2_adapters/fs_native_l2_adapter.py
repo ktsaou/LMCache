@@ -37,6 +37,8 @@ from lmcache.v1.distributed.l2_adapters.fs_l2_adapter import (
     _BOUNDED_PATH_VERSION,
     _bounded_relative_path_to_object_key,
     _filename_to_object_key,
+    _object_key_to_filename,
+    _object_key_to_relative_path,
 )
 
 logger = init_logger(__name__)
@@ -290,6 +292,27 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         )
 
 
+def _absent_native_fs_keys(base_path: str, keys: list[ObjectKey]) -> list[ObjectKey]:
+    """Return keys with neither a canonical nor a legacy object file.
+
+    One ``stat`` per path; a file another process published counts. Keys
+    whose paths cannot be derived are not reported.
+    """
+    base = Path(base_path)
+    absent = []
+    for key in keys:
+        try:
+            paths = (
+                base / _object_key_to_relative_path(key),
+                base / _object_key_to_filename(key),
+            )
+        except ValueError:
+            continue
+        if not any(os.path.exists(path) for path in paths):
+            absent.append(key)
+    return absent
+
+
 def _create_fs_native_l2_adapter(
     config: L2AdapterConfigBase,
     l1_memory_desc: "Optional[L1MemoryDesc]" = None,
@@ -334,6 +357,7 @@ def _create_fs_native_l2_adapter(
                 "read_ahead_size": config.read_ahead_size,
             },
             initial_key_sizes=initial_key_sizes,
+            absence_probe=lambda keys: _absent_native_fs_keys(config.base_path, keys),
         )
     except Exception:
         native_client.close()

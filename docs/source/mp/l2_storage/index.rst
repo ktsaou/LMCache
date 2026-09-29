@@ -450,29 +450,64 @@ auxiliary state are unique to each.
 
 The vLLM integration reports each published checkpoint with its token
 sequence and request.  When the prompt checkpoint of a new request is
-published, the server marks as *superseded* the unique pages of every
-shorter checkpoint of that sequence produced by an earlier request, and of
-the other checkpoints those requests published.  That includes a response
-endpoint that the chat template rewrote and the next prompt therefore does
-not extend.  Checkpoints of the same request and ``instruction``
-checkpoints, which other conversations share, are never marked.  With every
-store policy:
+published, the longest earlier checkpoint that it extends is where it
+continues from.  That checkpoint stays current: the new request may be a
+side request (a title or summary request that appends a task to the whole
+conversation, or a sub-agent forked from it) while the conversation itself
+goes on from the same point later.  The server marks as *superseded* the
+unique pages of every other shorter checkpoint of that sequence produced by
+an earlier request (the conversation has moved past them twice), and of the
+other checkpoints those requests published that the new prompt is longer
+than.  That includes a response endpoint that the chat template rewrote and
+the next prompt therefore does not extend.  A checkpoint at least as long as
+the new prompt is kept: the new request branched off before it.
+Checkpoints of the same request and ``instruction`` checkpoints, which other
+conversations share, are never marked.  With every store policy:
 
-* L1 eviction drops superseded pages before any LRU victim.
-* L2 eviction deletes superseded pages before any LRU victim.
+* L1 eviction drops stale superseded pages before any LRU victim.
+* L2 eviction deletes stale superseded pages before any LRU victim.
+
+A superseded page is stale at once, unless a later prompt had continued from
+its checkpoint (a possible branch point, for example the end of a turn that
+a sub-agent forked from and ran several turns on).  Such pages keep their
+normal eviction order for ``--checkpoint-supersede-grace-seconds`` (default
+300), so the conversation can still continue from them.  A lookup that finds
+a superseded checkpoint makes it current again.
 
 With ``--l2-store-policy checkpoint_on_evict`` in addition:
 
 * A current checkpoint page is written to L2 once, when L1 is about to
   evict it, instead of on every request.  L1 keeps the page until the
   write completes (at most ``--checkpoint-write-timeout-seconds``).
-* A superseded page is never written to L2.
-* Shutdown writes current pages still only in L1, so they can be restored
-  after a restart.
+* A superseded page is never written to L2 while serving, also during its
+  grace period.
+* Shutdown writes pages still only in L1, current pages first, so they can
+  be restored after a restart.
 
-Superseded manifests stay listed, so a request that branches from an older
-turn can still restore it while its pages last; when a page is gone, the
-restore falls back to the longest remaining checkpoint.
+A checkpoint is never offered once a page it needs is gone.  Before the last
+copy of a superseded page is deleted from L1 or L2, the superseded
+checkpoints that reference it are retired from the directory.  A lookup also
+checks the pages of the longest candidate against L1 and the L2 inventory:
+when a page was lost another way (L2 eviction, an administrative delete, a
+page that was not written before a restart), the lookup retires that
+candidate and returns the next shorter complete one in the same call.  A page
+counts as lost only when every L2 adapter confirms it does not hold it;
+``fs`` and ``fs_native`` check the object file, so pages another server
+sharing the directory wrote still count.  With adapters that cannot confirm
+an absence, the restore still validates every page and falls back to a
+shorter checkpoint.
+
+**Shutdown.**  ``--checkpoint-shutdown-flush-seconds`` (default 30) is the
+budget of a clean shutdown.  At SIGTERM the server first keeps serving
+checkpoint stores that are still in flight, so an engine stopping at the
+same time can publish the checkpoints it is copying.  This takes at most a
+third of the budget (and at most 5 s) and ends as soon as no store is in
+flight.  With ``checkpoint_on_evict`` it then writes pages still only in L1
+to L2 within the rest of the budget, current pages first, and logs how many
+it could not write.  Give the process that much time between SIGTERM and
+SIGKILL; with a shorter stop timeout the most valuable pages are written
+first, and the checkpoints left incomplete are retired by lookups after the
+restart.
 
 **Sizing.**  With write-through (``default``) the L2 retention time is about::
 
@@ -485,5 +520,7 @@ per conversation that leaves L1, so retention is about::
 
 and superseded pages are reclaimed first.  The
 ``lmcache_mp_checkpoint_retention`` gauge reports, per ``stat``, superseded
-pages, L1 drops and L2 evictions of superseded pages, write-on-evict
-requests, completions and timeouts, and the checkpoint bytes held in L2.
+pages (and those in their grace period), L1 drops and L2 evictions of
+superseded pages, retired checkpoints, superseded checkpoints found again,
+write-on-evict requests, completions and timeouts, and the checkpoint bytes
+held in L2.

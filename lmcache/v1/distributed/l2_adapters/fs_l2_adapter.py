@@ -721,6 +721,23 @@ class FSL2Adapter(L2AdapterInterface):
             self._require_representable_path(canonical)
         return tuple(candidates)
 
+    def absent_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return keys with no object file under any accepted path.
+
+        One ``stat`` per candidate path, so objects that other processes or
+        nodes sharing the directory published count as present. Keys whose
+        paths this filesystem cannot represent are not reported.
+        """
+        absent = []
+        for key in keys:
+            try:
+                paths = self._key_candidate_paths(key)
+            except (OSError, ValueError):
+                continue
+            if not any(os.path.exists(path) for path in paths):
+                absent.append(key)
+        return absent
+
     async def _existing_key_path(self, key: ObjectKey) -> Optional[Path]:
         """Resolve the first existing canonical or compatible legacy path."""
         for path in self._key_candidate_paths(key):

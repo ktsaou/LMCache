@@ -886,3 +886,13 @@ class TestEvictionInterface:
 
         assert len(l1.stored) == 1
         assert len(l2.stored) == 1
+
+
+def test_absent_keys_confirms_only_objects_the_mock_does_not_hold(adapter):
+    """The mock holds objects in memory, so it can confirm an absence."""
+    stored, missing = create_object_key(1), create_object_key(2)
+    assert adapter.absent_keys([stored, missing]) == [stored, missing]
+    _store_and_wait(adapter, stored, create_memory_obj())
+    assert adapter.absent_keys([stored, missing]) == [missing]
+    adapter.delete([stored])
+    assert adapter.absent_keys([stored, missing]) == [stored, missing]

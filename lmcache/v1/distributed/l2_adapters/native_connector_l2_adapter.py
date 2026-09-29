@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 import select
 import threading
 
@@ -98,6 +98,11 @@ class _PendingStore:
     buffer_owners: list[MemoryObj]
 
 
+def _confirm_no_absence(keys: list[ObjectKey]) -> list[ObjectKey]:
+    """Default absence probe: a backend without one cannot confirm a miss."""
+    return []
+
+
 class NativeConnectorL2Adapter(L2AdapterInterface):
     """
     Wraps a pybind-wrapped C++ IStorageConnector to
@@ -127,14 +132,20 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
         initial_key_sizes: Mapping[ObjectKey, int] | None = None,
+        absence_probe: Callable[[list[ObjectKey]], list[ObjectKey]] = (
+            _confirm_no_absence
+        ),
     ) -> None:
         """Create an adapter around a native storage connector.
 
         ``initial_key_sizes`` is a startup-only inventory supplied by a
         persistent backend. It seeds both capacity accounting and delete-time
         size tracking before the demultiplexer can process any completion.
+        ``absence_probe`` answers :meth:`absent_keys` synchronously (a
+        filesystem backend stats each object); the default confirms nothing.
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
+        self._absence_probe = absence_probe
         existing_key_sizes = dict(initial_key_sizes or {})
         self._initialize_usage(existing_key_sizes)
         self._client = native_client
@@ -205,6 +216,13 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         """Return a detached, immutable native-resident key snapshot."""
         with self._lock:
             return MappingProxyType(dict(self._key_sizes))
+
+    def absent_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return the keys the backend's absence probe confirms are missing.
+
+        Backends without a probe (the default) confirm nothing.
+        """
+        return self._absence_probe(keys)
 
     def has_inflight_store_for_keys(self, keys: list[ObjectKey]) -> bool:
         """Return whether a native store may still read any requested buffer.

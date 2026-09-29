@@ -1555,7 +1555,8 @@ def test_index_lists_ancestors_of_a_sequence_without_touching_lru() -> None:
 
 
 def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
-    """A new prompt supersedes earlier requests' checkpoints, not its own."""
+    """A new prompt supersedes earlier requests' checkpoints, not its own, and
+    not the one it continues from until a later prompt moves past that too."""
     name = f"lmcache_l1_pool_checkpoint_supersede_{uuid.uuid4().hex}"
     with open_store(shm_name=name) as (_, _, storage, mapping):
         module = CheckpointModule(
@@ -1576,8 +1577,9 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
             tail_2 = conversation_manifest((1, 2, 3), "t2", kind="prefill_tail")
             prompt_2 = conversation_manifest((1, 2, 3, 4), "p2", kind="prompt")
             response_2 = conversation_manifest((1, 2, 3, 4, 6), "r2")
+            prompt_3 = conversation_manifest((1, 2, 3, 4, 7, 8), "p3", kind="prompt")
             turns = (instruction, prompt_1, response_1, tail_2, prompt_2, response_2)
-            for turn in turns:
+            for turn in (*turns, prompt_3):
                 # Shared pages already resident come back without a slot.
                 assert module._index.begin(turn)
                 lease = module._payloads.prepare_store(turn, 0)
@@ -1593,6 +1595,9 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
             def roots(entry: CheckpointManifest) -> tuple[CheckpointPrefix, ...]:
                 return (entry.prefix,)
 
+            def unique(*entries: CheckpointManifest) -> set[ObjectKey]:
+                return {key for entry in entries for key in entry_keys(entry)}
+
             retention = storage.checkpoint_retention
             requests = ("r0", "r1", "r1", "r2", "r2", "r2")
             # Only a prompt supersedes, and turn 1 has no earlier request.
@@ -1600,14 +1605,13 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
                 assert module.supersede(roots(turn), turn.generation, request) == 0
             assert retention.superseded_keys() == []
 
+            # Turn 2 continues from turn 1's prompt, which stays current; it
+            # has moved past the rewritten response.
             marked = module.supersede(roots(prompt_2), prompt_2.generation, "r2")
-            current = set(entry_keys(prompt_2))
-            expected = (set(entry_keys(prompt_1)) | set(entry_keys(response_1))) - (
-                current
-            )
+            expected = unique(response_1) - unique(prompt_2)
             assert marked == len(expected) > 0
             assert set(retention.superseded_keys()) == expected
-            for kept in (instruction, tail_2, prompt_2):
+            for kept in (instruction, prompt_1, tail_2, prompt_2):
                 assert not any(retention.is_superseded(k) for k in entry_keys(kept))
             # The same request's response supersedes nothing.
             assert module.supersede(roots(response_2), response_2.generation, "r2") == 0
@@ -1618,13 +1622,24 @@ def test_supersede_marks_only_pages_older_turns_alone_reference() -> None:
                     prompt_2.generation,
                     "r2",
                 )
+
+            # Turn 3 continues from turn 2's prompt: turn 1's prompt, turn 2's
+            # tail and its rewritten response are passed now.
+            marked = module.supersede(roots(prompt_3), prompt_3.generation, "r3")
+            newly = unique(prompt_1, tail_2, response_2) - unique(prompt_3)
+            assert marked == len(newly) > 0
+            assert set(retention.superseded_keys()) == expected | newly
+            for kept in (instruction, prompt_2, prompt_3):
+                assert not any(retention.is_superseded(k) for k in entry_keys(kept))
         finally:
             module.close()
 
 
 def test_a_branch_keeps_the_checkpoints_it_branched_before() -> None:
-    """A retry or resumed turn supersedes the prompt it extends, but not the
-    longer response the original line continues from (lmcache-supersession-repro)."""
+    """A retry or resumed turn supersedes neither the prompt it continues from
+    nor the longer response the original line continues from
+    (lmcache-supersession-repro); the original line's next turn passes the
+    prompt, and a later one the response."""
     name = f"lmcache_l1_pool_checkpoint_branch_{uuid.uuid4().hex}"
     with open_store(shm_name=name) as (_, _, storage, mapping):
         module = CheckpointModule(
@@ -1642,9 +1657,12 @@ def test_a_branch_keeps_the_checkpoints_it_branched_before() -> None:
             # An aborted turn resumed with one other token: shorter than A's
             # response, so it branched before it.
             prompt_b = conversation_manifest((1, 2, 9), "pb", kind="prompt")
-            # The original line continues past A's response.
+            # The original line continues past A's response, then past C.
             prompt_c = conversation_manifest((1, 2, 5, 6, 7, 8), "pc", kind="prompt")
-            turns = (prompt_a, response_a, prompt_b, prompt_c)
+            prompt_d = conversation_manifest(
+                (1, 2, 5, 6, 7, 8, 10), "pd", kind="prompt"
+            )
+            turns = (prompt_a, response_a, prompt_b, prompt_c, prompt_d)
             for turn in turns:
                 assert module._index.begin(turn)
                 lease = module._payloads.prepare_store(turn, 0)
@@ -1662,16 +1680,19 @@ def test_a_branch_keeps_the_checkpoints_it_branched_before() -> None:
                 module.supersede((response_a.prefix,), response_a.generation, "a") == 0
             )
 
-            module.supersede((prompt_b.prefix,), prompt_b.generation, "b")
-            unique_a = set(entry_keys(prompt_a)) - set(entry_keys(prompt_b))
+            assert module.supersede((prompt_b.prefix,), prompt_b.generation, "b") == 0
+            assert retention.superseded_keys() == []
+
+            module.supersede((prompt_c.prefix,), prompt_c.generation, "c")
+            unique_a = set(entry_keys(prompt_a)) - set(entry_keys(prompt_c))
             assert unique_a and set(retention.superseded_keys()) == unique_a
             assert not any(retention.is_superseded(k) for k in entry_keys(response_a))
 
-            module.supersede((prompt_c.prefix,), prompt_c.generation, "c")
-            current = set(entry_keys(prompt_c))
-            assert set(retention.superseded_keys()) == (
-                unique_a | (set(entry_keys(response_a)) - current)
+            module.supersede((prompt_d.prefix,), prompt_d.generation, "d")
+            assert set(retention.superseded_keys()) == unique_a | (
+                set(entry_keys(response_a)) - set(entry_keys(prompt_d))
             )
+            assert not any(retention.is_superseded(k) for k in entry_keys(prompt_b))
         finally:
             module.close()
 

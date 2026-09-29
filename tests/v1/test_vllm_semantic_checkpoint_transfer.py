@@ -799,8 +799,14 @@ def test_semantic_roundtrip_collective_visibility_and_cancellation(
             worker.close()
 
 
-def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None:
-    """A restore whose pages are gone retries the directory, not the prompt."""
+@pytest.mark.parametrize("lookup_sees_loss", [True, False])
+def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint(
+    lookup_sees_loss: bool,
+) -> None:
+    """A checkpoint whose pages are gone falls back to the longest remaining
+    one, not the prompt. When the lookup can tell that no tier holds the
+    pages, it retires the checkpoint and answers with the shorter one at
+    once; otherwise the failed restore retries the directory."""
     with open_checkpoint_rpc() as (client, module, mapping, _name):
         manager = make_manager()
         bridge = CheckpointSchedulerBridge(
@@ -891,7 +897,16 @@ def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None
             consumer = make_request("consumer")
             attempts: list[tuple[int, bool]] = []
             deadline = time.monotonic() + 10
-            with patch.object(checkpoint_scheduler.logger, "info") as info:
+            retention = storage.checkpoint_retention
+            with (
+                patch.object(checkpoint_scheduler.logger, "info") as info,
+                patch.object(
+                    retention,
+                    "unavailable_pages",
+                    side_effect=None if lookup_sees_loss else lambda keys: [],
+                    wraps=retention.unavailable_pages,
+                ),
+            ):
                 while not bridge.poll_prefix(consumer):
                     assert time.monotonic() < deadline
                     for task in bridge.take_tasks():
@@ -901,12 +916,17 @@ def test_failed_restore_falls_back_to_the_longest_remaining_checkpoint() -> None
                         )
                     time.sleep(0.001)
 
-            assert attempts == [(11, False), (8, True)]
-            failure = next(
-                call.args for call in info.call_args_list if "failed" in call.args[0]
-            )
-            assert failure[1:4] == (11, consumer.request_id, [0, 1, 2, 3])
-            assert 0 <= failure[4] < 10
+            if lookup_sees_loss:
+                assert attempts == [(8, True)]
+            else:
+                assert attempts == [(11, False), (8, True)]
+                failure = next(
+                    call.args
+                    for call in info.call_args_list
+                    if "failed" in call.args[0]
+                )
+                assert failure[1:4] == (11, consumer.request_id, [0, 1, 2, 3])
+                assert 0 <= failure[4] < 10
             assert manager.get_computed_blocks(consumer)[1] == 8
             assert bridge.external_tokens(consumer) == 8
             assert not bridge.has_pending

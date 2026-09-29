@@ -1032,6 +1032,24 @@ class L1Manager:
         """Return the number of objects currently tracked in L1."""
         return len(self._objects)
 
+    def get_present_keys(self, keys: list[ObjectKey]) -> list[ObjectKey]:
+        """Return the given keys that L1 holds, in the order given.
+
+        An object counts while it is being written, since its writer may
+        still commit it. Like :meth:`is_key_evictable`, this does not acquire
+        the global L1Manager lock, so a long list never stalls other L1
+        operations; each key is a point-in-time check. Nothing is read or
+        touched: eviction order, listeners and events are unchanged.
+
+        Args:
+            keys: Keys to look up.
+
+        Returns:
+            The keys with an L1 object.
+        """
+        objects = self._objects
+        return [key for key in keys if key in objects]
+
     def is_key_evictable(self, key: ObjectKey) -> bool:
         """Check if a key is eligible for eviction (not locked).
 

@@ -392,3 +392,20 @@ def test_rejects_filesystem_below_protocol_limit(tmp_path: Path) -> None:
         pytest.raises(ValueError, match=r"PC_NAME_MAX >= 255, got 254"),
     ):
         FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+
+
+def test_absent_keys_sees_objects_other_adapters_stored(tmp_path: Path) -> None:
+    """Absence is checked on disk: an object another adapter instance stored
+    in the shared directory is present, a deleted one is absent."""
+    stored, missing = _long_key(salt_suffix="a"), _long_key(salt_suffix="b")
+    reader = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    writer = FSL2Adapter(FSL2AdapterConfig(base_path=str(tmp_path)))
+    try:
+        assert reader.absent_keys([stored, missing]) == [stored, missing]
+        _wait_for_store(writer, stored, b"payload")
+        assert reader.absent_keys([stored, missing]) == [missing]
+        writer.delete([stored])
+        assert reader.absent_keys([stored, missing]) == [stored, missing]
+    finally:
+        writer.close()
+        reader.close()

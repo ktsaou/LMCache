@@ -79,6 +79,12 @@ from lmcache.v1.platform.isolated_ipc import set_isolated_ipc
 
 logger = init_logger(__name__)
 
+# Upper bound of the shutdown drain of checkpoint stores in flight. It takes
+# at most a third of the checkpoint shutdown budget, so the L2 flush after it
+# keeps most of the budget, and a stop with Docker's default 10 s timeout
+# still leaves the flush time.
+_MAX_SHUTDOWN_DRAIN_SECONDS = 5.0
+
 
 def _unlink_configured_l1_shm(shm_name: str) -> None:
     """Remove the exact named L1 pool before measuring available capacity.
@@ -164,10 +170,37 @@ class MPCacheServer:
             status.update(module.report_status())
         return status
 
-    def close(self) -> None:
-        """Close all modules and release shared resources."""
+    def drain_for_shutdown(self) -> None:
+        """Let checkpoint stores still in flight finish before shutdown.
+
+        Call it once shutdown starts and before the message queue server
+        closes, so an engine stopping at the same time can still publish the
+        checkpoints it is copying. It starts the storage manager's shutdown
+        budget and uses at most a third of it (and at most a few seconds);
+        :meth:`close` then writes checkpoint pages to L2 within the rest.
+        """
+        deadline = self._context.storage_manager.start_shutdown()
+        now = time.monotonic()
+        drain_deadline = now + min(
+            _MAX_SHUTDOWN_DRAIN_SECONDS, max(0.0, deadline - now) / 3
+        )
         for module in self._modules:
-            module.close()
+            if isinstance(module, CheckpointModule):
+                module.drain_stores(drain_deadline)
+
+    def close(self) -> None:
+        """Close all modules and release shared resources.
+
+        A module that fails to close is logged and skipped, so the storage
+        manager still flushes checkpoints and releases the shared memory.
+        """
+        for module in self._modules:
+            try:
+                module.close()
+            except Exception:
+                logger.exception(
+                    "Closing %s failed; continuing shutdown", type(module).__name__
+                )
         self._context.close()
         logger.info("MPCacheServer closed")
 
@@ -541,6 +574,7 @@ def run_cache_server(
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutting down server...")
+        engine.drain_for_shutdown()
         event_bus.stop()
         server.close()
         engine.close()

@@ -167,6 +167,9 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down LMCache HTTP server...")
+    # Engines stopping at the same time may still be storing checkpoints;
+    # serve them for a bounded time, first, before the message queue closes.
+    engine.drain_for_shutdown()
     coordinator_registration_task = getattr(
         app.state, "coordinator_registration_task", None
     )
