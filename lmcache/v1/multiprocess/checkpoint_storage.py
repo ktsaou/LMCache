@@ -606,8 +606,8 @@ class CheckpointPayloadStore:
             The storage manager loads pages from L2 only into RAM it reserved
             for all of them, so a full RAM leaves stored pages unread. A lookup
             with unread pages is therefore repeated once RAM has room for them,
-            and only a repeated lookup that had that room invalidates the
-            generation. The lease stays pending while eviction makes room, for
+            and only a repeated lookup without allocation failure invalidates
+            the generation. The lease stays pending while eviction makes room, for
             at most the storage admission timeout; a lease that never gets
             room misses without invalidating its generation.
 
@@ -621,13 +621,16 @@ class CheckpointPayloadStore:
                 return lease.slots
             if lease.handle is None:
                 return self._repeat_with_room(lease_id, lease)
-            found = self._storage.query_prefetch_status(lease.handle)
-            if found is None:
+            result = self._storage.query_prefetch_status_detailed(lease.handle)
+            if result is None:
                 return None
+            found = result.found
             readable_keys = [key for i, key in enumerate(lease.keys) if found.test(i)]
             if len(readable_keys) != len(lease.keys) or lease.cancelled:
                 self._storage.finish_read_prefetched(readable_keys)
-                return self._repeat_or_miss(lease_id, lease, readable_keys)
+                return self._repeat_or_miss(
+                    lease_id, lease, readable_keys, result.reservation_failed
+                )
             try:
                 keys, objects = self._storage.unsafe_read(lease.keys)
                 if keys != lease.keys or len(objects) != len(keys):
@@ -652,30 +655,44 @@ class CheckpointPayloadStore:
                 raise
 
     def _repeat_or_miss(
-        self, lease_id: str, lease: _RetrieveLease, readable_keys: list[ObjectKey]
+        self,
+        lease_id: str,
+        lease: _RetrieveLease,
+        readable_keys: list[ObjectKey],
+        reservation_failed: bool,
     ) -> bool | None:
         """Repeat or end a lookup whose pages were not all pinned.
 
         Called with the lookup's read locks already released. Returns None
         when the lookup will be repeated, otherwise False after forgetting the
-        lease. Only a repeated lookup that had room in RAM invalidates.
+        lease. Only a repeated lookup without allocation failure invalidates.
         """
         lease.readable = len(readable_keys)
         if lease.cancelled:
             return self._miss(lease_id, lease, "was cancelled by the engine")
         groups = checkpoint_page_groups(lease.manifest)
         readable = set(readable_keys)
+        alignment = self._storage.l1_memory_desc.align_bytes
         lease.unread_bytes = sum(
-            groups[key.object_group_id].page_bytes
+            ((groups[key.object_group_id].page_bytes + alignment - 1) // alignment)
+            * alignment
             for key in lease.keys
             if key not in readable
         )
         used, total = self._storage.get_l1_usage()
+        if reservation_failed and lease.unread_bytes > total:
+            return self._miss(
+                lease_id, lease, "cannot fit in RAM; its checkpoint stays listed"
+            )
         # Without L2, or with more pages than RAM can hold, no repeat loads them.
         if (
             self._storage.l2_adapters()
             and lease.unread_bytes <= total
-            and (lease.lookups == 1 or total - used < lease.unread_bytes)
+            and (
+                reservation_failed
+                or lease.lookups == 1
+                or total - used < lease.unread_bytes
+            )
         ):
             lease.handle = None
             return self._repeat_with_room(lease_id, lease)
@@ -692,16 +709,16 @@ class CheckpointPayloadStore:
         """
         if lease.cancelled:
             return self._miss(lease_id, lease, "was cancelled by the engine")
-        used, total = self._storage.get_l1_usage()
-        if total - used >= lease.unread_bytes:
-            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
-            lease.lookups += 1
-            return None
         now = time.monotonic()
         if now - lease.started >= self._storage.store_admission_timeout_seconds:
             return self._miss(
                 lease_id, lease, "found no room in RAM; its checkpoint stays listed"
             )
+        used, total = self._storage.get_l1_usage()
+        if total - used >= lease.unread_bytes:
+            lease.handle = self._lookup(lease_id, lease.manifest, lease.keys)
+            lease.lookups += 1
+            return None
         if now - lease.eviction_requested >= _ROOM_REQUEST_INTERVAL_SECONDS:
             lease.eviction_requested = now
             self._storage.request_immediate_eviction()

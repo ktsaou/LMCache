@@ -56,6 +56,9 @@ from lmcache.v1.distributed.storage_controllers import (
     PrefetchController,
     StoreController,
 )
+from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+    PrefetchResult,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
 )
@@ -1030,13 +1033,27 @@ class StorageManager:
             done, None if it's still in progress. Derive the prefix hit count
             via ``count_leading_ones``.
         """
+        result = self.query_prefetch_status_detailed(handle)
+        return result.found if result is not None else None
+
+    def query_prefetch_status_detailed(
+        self, handle: PrefetchHandle
+    ) -> PrefetchResult | None:
+        """Consume hits and load-allocation evidence for ``handle``.
+
+        Returns None while pending or already consumed. Found bits index the
+        original requested keys. Bitmap-only queries consume the same result.
+        """
         l2_r: Bitmap | None = None
+        reservation_failed = False
         if handle.prefetch_request_id != -1:
-            l2_r = self._prefetch_controller.query_prefetch_result(
+            result = self._prefetch_controller.query_prefetch_result_detailed(
                 handle.prefetch_request_id
             )
-            if l2_r is None:
+            if result is None:
                 return None
+            l2_r = result.found
+            reservation_failed = result.reservation_failed
 
         found = self._combine_found(handle, l2_r)
         # popcount (not count_leading_ones) so the log is accurate for
@@ -1060,7 +1077,7 @@ class StorageManager:
                 handle.external_request_id,
                 handle.prefetch_request_id,
             )
-        return found
+        return PrefetchResult(found, reservation_failed)
 
     def touch_l1_keys(self, keys: list[ObjectKey]):
         """

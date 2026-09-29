@@ -193,6 +193,18 @@ class PrefetchPhase(enum.Enum):
     PLAN_AND_LOAD = enum.auto()
 
 
+@dataclass(frozen=True)
+class PrefetchResult:
+    """Retained keys and whether reserving their load buffers failed.
+
+    Allocation failure or contention does not prove stored pages are absent.
+    ``found`` indexes the keys submitted to the prefetch request.
+    """
+
+    found: Bitmap
+    reservation_failed: bool = False
+
+
 @dataclass
 class InFlightPrefetchRequest:
     """Tracks a single prefetch request across its lifecycle phases."""
@@ -244,6 +256,8 @@ class InFlightPrefetchRequest:
     group_layout_descs: dict[int, MemoryLayoutDesc] = field(default_factory=dict)
     """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
     describes a single group's MemoryObj). Covers every object group."""
+
+    reservation_failed: bool = False
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -338,6 +352,7 @@ class PrefetchController(StorageControllerInterface):
         self._prefetch_results_lock = threading.Lock()
         self._prefetch_results_cv = threading.Condition(self._prefetch_results_lock)
         self._completed_results: dict[PrefetchRequestId, Bitmap] = {}
+        self._completed_reservation_failures: set[PrefetchRequestId] = set()
 
         # Map eventfds to adapter indices for quick lookup in poll.
         # Relies on the L2AdapterInterface contract that every adapter
@@ -488,12 +503,26 @@ class PrefetchController(StorageControllerInterface):
             query_lookup_result after calling this function, otherwise it will
             get None forever.
         """
+        result = self.query_prefetch_result_detailed(request_id)
+        return result.found if result is not None else None
+
+    def query_prefetch_result_detailed(
+        self, request_id: PrefetchRequestId
+    ) -> PrefetchResult | None:
+        """Consume hits and allocation evidence for ``request_id`` atomically.
+
+        Returns None while pending or already consumed. Bitmap-only queries
+        consume the same result and release the same lookup bookkeeping.
+        """
         with self._prefetch_results_lock:
-            result = self._completed_results.pop(request_id, None)
-        if result is not None:
-            with self._lookup_results_lock:
-                self._completed_lookups.pop(request_id, None)
-        return result
+            found = self._completed_results.pop(request_id, None)
+            if found is None:
+                return None
+            failed = request_id in self._completed_reservation_failures
+            self._completed_reservation_failures.discard(request_id)
+        with self._lookup_results_lock:
+            self._completed_lookups.pop(request_id, None)
+        return PrefetchResult(found, failed)
 
     def wait_prefetch_result(
         self, request_id: PrefetchRequestId, timeout: float
@@ -1102,6 +1131,7 @@ class PrefetchController(StorageControllerInterface):
                 request.write_reserved_objs[key] = mem_obj
                 reserved.add(key)
                 continue
+            request.reservation_failed = True
             if err == L1Error.OUT_OF_MEMORY:
                 oom_keys.append(key)
             elif err == L1Error.KEY_NOT_WRITABLE:
@@ -1600,6 +1630,9 @@ class PrefetchController(StorageControllerInterface):
     def _complete_request(self, request_id: PrefetchRequestId, result: Bitmap) -> None:
         """Store the retained-key bitmap and remove from in-flight tracking."""
         with self._prefetch_results_lock:
+            request = self._in_flight_requests.get(request_id)
+            if request is not None and request.reservation_failed:
+                self._completed_reservation_failures.add(request_id)
             self._completed_results[request_id] = result
             # Wake any WAIT_PREFETCH_STATUS handler blocked on this result.
             self._prefetch_results_cv.notify_all()
