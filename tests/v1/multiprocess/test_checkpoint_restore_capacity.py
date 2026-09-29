@@ -57,7 +57,9 @@ def test_restore_accounts_for_page_alignment(tmp_path: Path, native: bool) -> No
         assert reserved[filler][1] is not None
         try:
             # Raw payload bytes fit; seven separate aligned allocations do not.
-            assert poll(service, service.begin_retrieve(entry, 0)) is False
+            lease_id = service.begin_retrieve(entry, 0)
+            assert lease_id is not None
+            assert poll(service, lease_id) is False
             assert index.get(entry.generation) == entry
         finally:
             storage.abort_write([filler])
@@ -111,7 +113,9 @@ def test_restore_uses_allocation_result_before_capacity_returns(
                     side_effect=release_before_consumption,
                 ),
             ):
-                assert poll(service, service.begin_retrieve(entry, 0)) is False
+                lease_id = service.begin_retrieve(entry, 0)
+                assert lease_id is not None
+                assert poll(service, lease_id) is False
             assert attempts >= 2
             assert index.get(entry.generation) == entry
         finally:
@@ -148,7 +152,9 @@ def test_prefetch_queries_consume_capacity_failure_once(
                 assert result is not None and result.reservation_failed
                 found = result.found
             else:
-                found = storage.query_prefetch_status(handle)
+                legacy_found = storage.query_prefetch_status(handle)
+                assert legacy_found is not None
+                found = legacy_found
             assert found is not None and found.popcount() == 0
             assert storage.query_prefetch_status_detailed(handle) is None
             assert storage.query_prefetch_status(handle) is None
