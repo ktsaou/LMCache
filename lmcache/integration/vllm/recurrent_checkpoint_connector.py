@@ -387,6 +387,27 @@ class LMCacheRecurrentCheckpointConnector(KVConnectorBase_V1, SupportsHMA):
         self._scheduler.accept_layouts(metadata.layouts)
         self._scheduler.complete(metadata.results)
 
+    # Keep deferred sample replies aggregated after the last task drains.
+    _GATHER_TRAILING_STEPS = 2
+    _gather_steps_left = 0
+
+    def requires_all_worker_outputs(self) -> bool:
+        """Gather rank metadata until layouts and copies drain, plus two steps.
+
+        Called after build_connector_meta by vLLM's optional gather hook.
+        The trailing steps cover deferred sample_tokens replies from an earlier
+        execute_model call. Older vLLM versions ignore this hook and gather
+        every step. Returns True conservatively without a scheduler bridge.
+        """
+        # Layout negotiation and copies remain pending until every rank reports.
+        if self._scheduler is None or self.has_pending_push_work():
+            self._gather_steps_left = self._GATHER_TRAILING_STEPS
+            return True
+        if self._gather_steps_left > 0:
+            self._gather_steps_left -= 1
+            return True
+        return False
+
     def has_pending_push_work(self) -> bool:
         """Keep connector-only engine steps alive until collective copies drain."""
         return self._scheduler is not None and self._scheduler.has_pending
