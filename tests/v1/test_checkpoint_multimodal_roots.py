@@ -32,8 +32,11 @@ TOKENS = list(range(300))
 
 
 def roots(images, salt=b"{}"):
-    bridge = SimpleNamespace(_identity=IDENTITY, _multimodal_salt=salt)
+    bridge = SimpleNamespace(
+        _identity=IDENTITY, _multimodal_salt=salt, _request_roots={}
+    )
     request = SimpleNamespace(
+        request_id="request",
         all_token_ids=TOKENS,
         cache_salt=None,
         mm_features=[

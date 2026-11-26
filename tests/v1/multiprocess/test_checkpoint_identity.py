@@ -5,6 +5,7 @@
 from dataclasses import replace
 from typing import cast
 import json
+import random
 import uuid
 
 # Third Party
@@ -120,3 +121,61 @@ def test_token_roots_content_key_is_stable_at_full_and_partial_chunks() -> None:
         roots.content_key(9000, "attention:0"),
         roots.content_key(9000, "auxiliary"),
     )
+
+
+@pytest.mark.parametrize("chunk_tokens", [1, 7, 4096])
+def test_extended_roots_equal_a_full_build(chunk_tokens: int) -> None:
+    rng = random.Random(chunk_tokens)
+    tokens = [rng.randrange(2**31) for _ in range(3 * chunk_tokens + 5)]
+    grown = 0
+    roots = CheckpointTokenRoots.build("ns", [], chunk_tokens=chunk_tokens)
+    while grown < len(tokens):
+        grown = min(len(tokens), grown + rng.randrange(1, 2 * chunk_tokens + 2))
+        previous = roots
+        roots = roots.extended(tokens[:grown])
+        full = CheckpointTokenRoots.build(
+            "ns", tokens[:grown], chunk_tokens=chunk_tokens
+        )
+        assert roots == full
+        boundaries = [(n, "page") for n in {1, grown, (grown + 1) // 2}]
+        assert roots.content_keys(boundaries) == full.content_keys(boundaries)
+        assert roots.prefix(grown) == full.prefix(grown)
+        # Complete chunks are reused, not hashed again.
+        kept = (previous.roots[-1].num_tokens if previous.roots else 0) // chunk_tokens
+        assert all(
+            a is b
+            for a, b in zip(roots.roots[:kept], previous.roots[:kept], strict=True)
+        )
+    assert roots.extended(tokens) is roots
+
+
+def test_extended_roots_rebuild_when_the_sequence_does_not_continue() -> None:
+    tokens = list(range(100, 130))
+    roots = CheckpointTokenRoots.build("ns", tokens, chunk_tokens=8)
+
+    shorter = tokens[:20]
+    assert roots.extended(shorter) == CheckpointTokenRoots.build(
+        "ns", shorter, chunk_tokens=8
+    )
+    # A change in the last complete or the incomplete chunk is detected.
+    for position in (17, 29):
+        changed = list(tokens) + [7, 8, 9]
+        changed[position] += 1
+        assert roots.extended(changed) == CheckpointTokenRoots.build(
+            "ns", changed, chunk_tokens=8
+        )
+
+
+@pytest.mark.parametrize("token", [-1, 2**31, True, 1.0, "1", None])
+def test_token_roots_reject_tokens_outside_the_wire_domain(token: object) -> None:
+    tokens = cast(list[int], [1, 2, token, 3])
+    with pytest.raises(ValueError, match="wire limits"):
+        CheckpointTokenRoots.build("ns", tokens)
+    roots = CheckpointTokenRoots.build("ns", [1, 2])
+    with pytest.raises(ValueError, match="wire limits"):
+        roots.extended(cast(list[int], [1, 2, token]))
+
+
+def test_token_roots_accept_the_wire_domain_limits() -> None:
+    roots = CheckpointTokenRoots.build("ns", [0, 2**31 - 1])
+    assert roots.roots[0].tail_tokens == (0, 2**31 - 1)

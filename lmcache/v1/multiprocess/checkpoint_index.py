@@ -62,6 +62,15 @@ def _query_parameters(query: "CheckpointPrefix") -> dict[str, object]:
     }
 
 
+def _wire_tokens(tokens: tuple[int, ...]) -> bool:
+    """Whether every token of a nonempty tail is a plain int below 2**31.
+
+    The engine thread checks every token of a prompt here, so the scan uses
+    C-level built-ins rather than a Python loop over the tokens.
+    """
+    return set(map(type, tokens)) == {int} and min(tokens) >= 0 and max(tokens) < 2**31
+
+
 @dataclass(frozen=True)
 class CheckpointPrefix:
     """A namespace-isolated prefix ending between ordinary hash boundaries.
@@ -82,10 +91,7 @@ class CheckpointPrefix:
             raise ValueError("checkpoint namespace must contain 1..256 characters")
         if self.start_tokens < 0 or not self.tail_tokens:
             raise ValueError("checkpoint prefix requires a nonempty token tail")
-        if len(self.tail_tokens) > 65536 or any(
-            type(token) is not int or not 0 <= token < 2**31
-            for token in self.tail_tokens
-        ):
+        if len(self.tail_tokens) > 65536 or not _wire_tokens(self.tail_tokens):
             raise ValueError("checkpoint token tail exceeds the wire limits")
         if len(self.prefix_hash) not in (0, 32) or (
             self.start_tokens > 0 and not self.prefix_hash

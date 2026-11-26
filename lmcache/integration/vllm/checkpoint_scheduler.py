@@ -30,6 +30,8 @@ logger = init_logger(__name__)
 # the server invalidate the missing generation, so each retry receives the
 # longest candidate that is still listed rather than recomputing the prompt.
 _MAX_LOOKUP_ATTEMPTS = 4
+# Requests whose token roots are kept between a lookup and later stores.
+_MAX_REQUEST_ROOTS = 256
 
 # Restores slower than this many seconds are logged even when they succeed;
 # the request waits in the scheduler, deferred, for the whole restore.
@@ -197,6 +199,9 @@ class CheckpointSchedulerBridge:
         self._layouts: dict[int, dict[str, Any]] = {}
         self._layout: dict[str, Any] | None = None
         self._lookups: dict[str, _Lookup] = {}
+        # Token roots of live text requests, most recently used last, so a
+        # store hashes only the tokens added since the request's last build.
+        self._request_roots: dict[str, CheckpointTokenRoots] = {}
         self._tasks: dict[str, _PendingTask] = {}
         self._cancelled: set[str] = set()
 
@@ -771,6 +776,7 @@ class CheckpointSchedulerBridge:
         if self._reserve_admission:
             self._manager.release_external_boundary_admission(request_id)
         self._lookups.pop(request_id, None)
+        self._request_roots.pop(request_id, None)
         if any(task.request_id == request_id for task in self._tasks.values()):
             self._cancelled.add(request_id)
         else:
@@ -799,17 +805,33 @@ class CheckpointSchedulerBridge:
         }
 
     def _roots(self, request: "Request") -> CheckpointTokenRoots:
+        """Return the token roots of a request's current token sequence.
+
+        A text request's roots are kept until it finishes and extended by its
+        new tokens, because its token list only grows. Multimodal requests are
+        built from the start each time.
+        """
+        namespace = checkpoint_namespace(self._identity, request.cache_salt or "")
         tokens = request.all_token_ids
         if request.mm_features:
             # Placeholder IDs are equal for every image; name spans by content.
             # Third Party
             from vllm.v1.core.boundary_checkpoint import content_token_ids
 
-            tokens = content_token_ids(request, 0, len(tokens), self._multimodal_salt)
-        return CheckpointTokenRoots.build(
-            checkpoint_namespace(self._identity, request.cache_salt or ""),
-            tokens,
-        )
+            return CheckpointTokenRoots.build(
+                namespace,
+                content_token_ids(request, 0, len(tokens), self._multimodal_salt),
+            )
+        known = self._request_roots.pop(request.request_id, None)
+        if known is not None and known.namespace == namespace:
+            roots = known.extended(tokens)
+        else:
+            roots = CheckpointTokenRoots.build(namespace, tokens)
+        self._request_roots[request.request_id] = roots
+        while len(self._request_roots) > _MAX_REQUEST_ROOTS:
+            # Bounds memory if a request never reports its end; it is rebuilt.
+            del self._request_roots[next(iter(self._request_roots))]
+        return roots
 
     def _validate_manifest(
         self, manifest: CheckpointManifest, roots: CheckpointTokenRoots

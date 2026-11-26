@@ -104,6 +104,50 @@ def checkpoint_namespace(identity: dict[str, object], cache_salt: str) -> str:
     return "recurrent-sha256-v1:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _chain_seed(chunk_tokens: int) -> bytes:
+    """Digest that starts the token hash chain of one hash unit size."""
+    return hashlib.sha256(
+        b"lmcache-recurrent-token-roots-v1\0" + chunk_tokens.to_bytes(4, "little")
+    ).digest()
+
+
+def _chain_roots(
+    namespace: str,
+    token_ids: Sequence[int],
+    chunk_tokens: int,
+    start: int,
+    chain: bytes,
+) -> tuple[list[CheckpointPrefix], list[bytes]]:
+    """Hash ``token_ids`` from a chunk boundary onward.
+
+    Args:
+        namespace: Result of checkpoint_namespace for this request.
+        token_ids: The whole token sequence.
+        chunk_tokens: Hash unit; ``start`` is a multiple of it.
+        start: First token to hash.
+        chain: Chain digest of the ``start`` tokens before it.
+
+    Returns:
+        One root per chunk from ``start``, and the chain digest after each.
+
+    Raises:
+        ValueError: If a token is outside the wire domain.
+    """
+    roots = []
+    end_hashes = []
+    for chunk_start in range(start, len(token_ids), chunk_tokens):
+        tail = tuple(token_ids[chunk_start : chunk_start + chunk_tokens])
+        roots.append(CheckpointPrefix(namespace, chunk_start, chain, tail))
+        packed = array("I", tail)
+        if packed.itemsize != 4:
+            raise ValueError("Checkpoint tokens require 32-bit unsigned integers")
+        if sys.byteorder != "little":
+            packed.byteswap()
+        chain = hashlib.sha256(chain + packed.tobytes()).digest()
+        end_hashes.append(chain)
+    return roots, end_hashes
+
+
 @dataclass(frozen=True)
 class CheckpointTokenRoots:
     """Restart-stable hash roots with exact token tails for longest-prefix lookup.
@@ -137,23 +181,57 @@ class CheckpointTokenRoots:
         """
         if not 1 <= chunk_tokens <= 65536:
             raise ValueError("Checkpoint hash unit must be in 1..65536")
-        chain = hashlib.sha256(
-            b"lmcache-recurrent-token-roots-v1\0" + chunk_tokens.to_bytes(4, "little")
-        ).digest()
-        roots = []
-        end_hashes = []
-        for start in range(0, len(token_ids), chunk_tokens):
-            tail = tuple(token_ids[start : start + chunk_tokens])
-            root = CheckpointPrefix(namespace, start, chain, tail)
-            roots.append(root)
-            packed = array("I", tail)
-            if packed.itemsize != 4:
-                raise ValueError("Checkpoint tokens require 32-bit unsigned integers")
-            if sys.byteorder != "little":
-                packed.byteswap()
-            chain = hashlib.sha256(chain + packed.tobytes()).digest()
-            end_hashes.append(chain)
+        roots, end_hashes = _chain_roots(
+            namespace, token_ids, chunk_tokens, 0, _chain_seed(chunk_tokens)
+        )
         return cls(namespace, tuple(roots), chunk_tokens, tuple(end_hashes))
+
+    def extended(self, token_ids: Sequence[int]) -> "CheckpointTokenRoots":
+        """Return the roots of a sequence that continues the covered one.
+
+        Complete hash chunks keep their roots and digests; only the tokens
+        from the last incomplete chunk onward are hashed. A request stores
+        several checkpoints while its token list only grows, so each store
+        costs the new tokens rather than the whole prompt.
+
+        Args:
+            token_ids: The covered tokens followed by zero or more new ones.
+                The caller guarantees the earlier tokens are unchanged, as for
+                the append-only token list of one request.
+
+        Returns:
+            Roots equal to ``build(namespace, token_ids)``. The last one or
+            two covered chunks are compared with ``token_ids``; a shorter or
+            differing sequence is built from the start instead.
+
+        Raises:
+            ValueError: If a new token is outside the wire domain.
+        """
+        if not self.roots:
+            return self.build(self.namespace, token_ids, chunk_tokens=self.chunk_tokens)
+        covered = self.roots[-1].num_tokens
+        checked = self.roots[-2:]
+        if len(token_ids) < covered or any(
+            tuple(token_ids[root.start_tokens : root.num_tokens]) != root.tail_tokens
+            for root in checked
+        ):
+            return self.build(self.namespace, token_ids, chunk_tokens=self.chunk_tokens)
+        if len(token_ids) == covered:
+            return self
+        keep = covered // self.chunk_tokens
+        roots, end_hashes = _chain_roots(
+            self.namespace,
+            token_ids,
+            self.chunk_tokens,
+            keep * self.chunk_tokens,
+            self.end_hashes[keep - 1] if keep else _chain_seed(self.chunk_tokens),
+        )
+        return CheckpointTokenRoots(
+            self.namespace,
+            self.roots[:keep] + tuple(roots),
+            self.chunk_tokens,
+            self.end_hashes[:keep] + tuple(end_hashes),
+        )
 
     def prefix(self, num_tokens: int) -> CheckpointPrefix:
         """Return the exact stored key for a nonempty covered token prefix.
