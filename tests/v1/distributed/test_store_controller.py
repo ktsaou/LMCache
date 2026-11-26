@@ -24,10 +24,12 @@ from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     ObjectKey,
 )
+from lmcache.v1.distributed.checkpoint_retention import CheckpointRetention
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.eviction_policy.noop import (
     NoOpEvictionPolicy,
 )
+from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
@@ -779,6 +781,95 @@ def settle(ctrl: StoreController) -> bool:
         )
 
     return wait_for_condition(idle)
+
+
+class RejectingL2Adapter(CountingL2Adapter):
+    """CountingL2Adapter that fails its first ``rejections`` store tasks.
+
+    Mirrors an adapter that refuses a store because its capacity is
+    momentarily exhausted and accepts it once eviction has made room.
+    """
+
+    def __init__(self, config: MockL2AdapterConfig, rejections: int) -> None:
+        super().__init__(config)
+        self._rejections = rejections
+
+    def submit_store_task(self, keys, objects):
+        if self._rejections <= 0:
+            return super().submit_store_task(keys, objects)
+        self._rejections -= 1
+        self.submitted.extend(keys)
+        with self._lock:
+            task_id = self._get_next_task_id()
+            self._completed_store_tasks[task_id] = L2StoreResult(False, 0)
+        self._signal_store_event()
+        return task_id
+
+
+class TestStoreControllerFailedStores:
+    """A failed store task is reported so its keys can be stored again."""
+
+    def test_failed_store_reports_its_keys_and_can_be_resubmitted(self, l1_manager):
+        adapter = RejectingL2Adapter(
+            MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0),
+            rejections=1,
+        )
+        failed: list[list[ObjectKey]] = []
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=CheckpointReuseStorePolicy(),
+            on_store_failed=failed.append,
+        )
+        ctrl.start()
+        pages = [make_checkpoint_key(i) for i in range(3)]
+        write_keys_to_l1(l1_manager, pages, make_layout())
+
+        ctrl.submit_reused_keys(pages)
+        assert wait_for_condition(lambda: len(failed) == 1)
+        assert sorted(failed[0], key=lambda k: k.chunk_hash) == sorted(
+            pages, key=lambda k: k.chunk_hash
+        )
+        assert settle(ctrl)
+        # The failed store released its read locks.
+        assert all(l1_manager.is_key_evictable(key) for key in pages)
+
+        ctrl.submit_reused_keys(pages)
+        assert wait_for_condition(lambda: len(adapter.submitted) == 6)
+        assert settle(ctrl)
+        assert len(failed) == 1
+        ctrl.stop()
+        adapter.close()
+
+    def test_failed_store_is_retried_by_the_store_loop(self, l1_manager):
+        adapter = RejectingL2Adapter(
+            MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0),
+            rejections=1,
+        )
+        retention = CheckpointRetention(write_on_evict=True, persist_retry_seconds=0.0)
+        ctrl = StoreController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=CheckpointReuseStorePolicy(),
+            on_store_failed=retention.record_persist_failed,
+            retry_failed_stores=retention.retry_failed,
+        )
+        retention.set_persist(ctrl.submit_reused_keys)
+        ctrl.start()
+        pages = [make_checkpoint_key(i) for i in range(3)]
+        write_keys_to_l1(l1_manager, pages, make_layout())
+
+        # One request, as from a single eviction pass; nothing asks again.
+        assert retention.request_persist(pages) == 3
+        assert wait_for_condition(lambda: len(adapter.submitted) == 6)
+        assert settle(ctrl)
+        status = retention.report_status()
+        assert status["write_on_evict_failures"] == 3
+        assert status["write_on_evict_retries"] == 3
+        ctrl.stop()
+        adapter.close()
 
 
 class TestStoreControllerReuseAdmission:

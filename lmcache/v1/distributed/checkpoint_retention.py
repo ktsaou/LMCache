@@ -127,6 +127,8 @@ class CheckpointRetention:
             checkpoints.
         persist_timeout: Seconds after which a page whose write never
             completed may be evicted from L1 without reaching L2.
+        persist_retry_seconds: Seconds a page whose write failed waits before
+            the write is requested again.
         supersede_grace_seconds: How long a superseded checkpoint that a
             later prompt continued from keeps its LRU position before its
             pages are dropped first. 0 drops every superseded page first.
@@ -141,6 +143,7 @@ class CheckpointRetention:
         max_tracked: int = 1048576,
         max_generations: int = 65536,
         persist_timeout: float = 120.0,
+        persist_retry_seconds: float = 5.0,
         supersede_grace_seconds: float = 0.0,
     ) -> None:
         if supersede_grace_seconds < 0:
@@ -151,6 +154,7 @@ class CheckpointRetention:
         self._max_tracked = max_tracked
         self._max_generations = max_generations
         self._persist_timeout = persist_timeout
+        self._persist_retry = persist_retry_seconds
         self._grace = supersede_grace_seconds
         self._lock = threading.Lock()
         # Superseded pages in the order they were first marked.
@@ -165,6 +169,8 @@ class CheckpointRetention:
         self._resident: dict[int, OrderedDict[ObjectKey, int]] = {}
         # key -> monotonic time its write was requested
         self._pending: dict[ObjectKey, float] = {}
+        # pending key -> monotonic time its last write failed
+        self._failed: dict[ObjectKey, float] = {}
         self._l1_present: Callable[[list[ObjectKey]], list[ObjectKey]] = _all_present
         self._l2_absent: Callable[[list[ObjectKey]], list[ObjectKey]] = _all_absent
         self._retire: Callable[[list[str]], None] = _retire_nothing
@@ -176,6 +182,8 @@ class CheckpointRetention:
             "l2_superseded_eviction_bytes": 0,
             "write_on_evict_requests": 0,
             "write_on_evict_persisted": 0,
+            "write_on_evict_failures": 0,
+            "write_on_evict_retries": 0,
             "write_on_evict_timeouts": 0,
             "retired_checkpoints": 0,
             "restored_checkpoints": 0,
@@ -451,6 +459,7 @@ class CheckpointRetention:
                 resident[key] = size
                 resident.move_to_end(key)
                 if self._pending.pop(key, None) is not None:
+                    self._failed.pop(key, None)
                     self._stats["write_on_evict_persisted"] += 1
             while len(resident) > self._max_tracked:
                 resident.popitem(last=False)
@@ -545,10 +554,12 @@ class CheckpointRetention:
                 return False
             if self._is_resident_locked(key):
                 self._pending.pop(key, None)
+                self._failed.pop(key, None)
                 return False
             requested = self._pending.get(key)
             if requested is not None and now - requested > self._persist_timeout:
                 del self._pending[key]
+                self._failed.pop(key, None)
                 self._stats["write_on_evict_timeouts"] += 1
                 logger.warning(
                     "Checkpoint page write to L2 did not complete within %.0f s; "
@@ -559,16 +570,74 @@ class CheckpointRetention:
             return True
 
     def request_persist(self, keys: list[ObjectKey]) -> int:
-        """Ask the store controller to write pages not already requested."""
+        """Ask the store controller to write pages with no write under way.
+
+        A page is submitted when it was not requested yet, or when its last
+        write failed at least ``persist_retry_seconds`` ago. A retried page
+        keeps its first request time, so ``persist_timeout`` still bounds how
+        long L1 holds a page that L2 keeps refusing.
+
+        Returns:
+            Number of pages submitted.
+        """
         now = time.monotonic()
         with self._lock:
             fresh = [key for key in keys if key not in self._pending]
+            retry = [
+                key
+                for key in keys
+                if key in self._failed
+                and now - self._failed[key] >= self._persist_retry
+            ]
             for key in fresh:
                 self._pending[key] = now
+            for key in retry:
+                del self._failed[key]
             self._stats["write_on_evict_requests"] += len(fresh)
-        if fresh and self._persist is not None:
-            self._persist(fresh)
-        return len(fresh)
+            self._stats["write_on_evict_retries"] += len(retry)
+        submit = fresh + retry
+        if submit and self._persist is not None:
+            self._persist(submit)
+        return len(submit)
+
+    def record_persist_failed(self, keys: list[ObjectKey]) -> None:
+        """Note that an L2 write of ``keys`` failed, so it can be requested again.
+
+        Without this a failed page stays marked as requested, no later
+        eviction pass submits it, and it leaves L1 at ``persist_timeout``
+        with no L2 copy even if L2 has room by then.
+        """
+        now = time.monotonic()
+        with self._lock:
+            failed = [key for key in keys if key in self._pending]
+            for key in failed:
+                self._failed[key] = now
+            self._stats["write_on_evict_failures"] += len(failed)
+
+    def retry_failed(self) -> int:
+        """Request again every failed write that waited ``persist_retry_seconds``.
+
+        Called periodically, so a retry does not depend on a later eviction
+        pass offering the same page: such a pass may come after
+        ``persist_timeout``, when the page is given up instead of retried
+        although L2 has room again.
+
+        Returns:
+            Number of pages submitted.
+        """
+        now = time.monotonic()
+        with self._lock:
+            due = [
+                key
+                for key, failed_at in self._failed.items()
+                if now - failed_at >= self._persist_retry
+            ]
+            for key in due:
+                del self._failed[key]
+            self._stats["write_on_evict_retries"] += len(due)
+        if due and self._persist is not None:
+            self._persist(due)
+        return len(due)
 
     def pending_count(self) -> int:
         with self._lock:

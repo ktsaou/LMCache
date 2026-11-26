@@ -211,6 +211,8 @@ class StorageManager:
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=store_policy,
+            on_store_failed=self._checkpoint_retention.record_persist_failed,
+            retry_failed_stores=self._checkpoint_retention.retry_failed,
         )
         self._store_controller.start()
         self._checkpoint_retention.set_persist(

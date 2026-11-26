@@ -108,6 +108,96 @@ def test_timed_out_write_allows_eviction():
     assert retention.pending_count() == 0
 
 
+def test_failed_write_is_requested_again_after_the_retry_delay():
+    persisted: list[list[ObjectKey]] = []
+    retention = CheckpointRetention(
+        write_on_evict=True,
+        persist=persisted.append,
+        persist_timeout=120.0,
+        persist_retry_seconds=5.0,
+    )
+    retention.listener_for(0)
+    key, other = make_key(1), make_key(2)
+    with patch("time.monotonic", return_value=100.0):
+        assert retention.request_persist([key, other]) == 2
+    with patch("time.monotonic", return_value=101.0):
+        # L2 refused the page, for example because it was momentarily full.
+        retention.record_persist_failed([key])
+    with patch("time.monotonic", return_value=103.0):
+        assert retention.request_persist([key, other]) == 0
+    with patch("time.monotonic", return_value=106.0):
+        # Only the failed page is submitted again; the other is in flight.
+        assert retention.request_persist([key, other]) == 1
+        assert retention.request_persist([key, other]) == 0
+    assert persisted == [[key, other], [key]]
+
+    retention.record_l2_present(0, [key], [4096])
+    assert not retention.needs_persist_before_evict(key)
+    status = retention.report_status()
+    assert status["write_on_evict_requests"] == 2
+    assert status["write_on_evict_failures"] == 1
+    assert status["write_on_evict_retries"] == 1
+    assert status["write_on_evict_persisted"] == 1
+    assert status["write_on_evict_timeouts"] == 0
+
+
+def test_failed_write_is_retried_without_another_eviction_pass():
+    persisted: list[list[ObjectKey]] = []
+    retention = CheckpointRetention(
+        write_on_evict=True,
+        persist=persisted.append,
+        persist_timeout=120.0,
+        persist_retry_seconds=5.0,
+    )
+    retention.listener_for(0)
+    key, other = make_key(1), make_key(2)
+    with patch("time.monotonic", return_value=100.0):
+        assert retention.request_persist([key, other]) == 2
+    with patch("time.monotonic", return_value=101.0):
+        retention.record_persist_failed([key])
+    with patch("time.monotonic", return_value=103.0):
+        assert retention.retry_failed() == 0
+    with patch("time.monotonic", return_value=106.0):
+        # Only the failed page is submitted again; the other is in flight.
+        assert retention.retry_failed() == 1
+        assert retention.retry_failed() == 0
+    assert persisted == [[key, other], [key]]
+
+    retention.record_l2_present(0, [key], [4096])
+    with patch("time.monotonic", return_value=700.0):
+        # The next eviction pass comes long after persist_timeout: the page
+        # reached L2 meanwhile and is not counted as lost.
+        assert not retention.needs_persist_before_evict(key)
+    status = retention.report_status()
+    assert status["write_on_evict_failures"] == 1
+    assert status["write_on_evict_retries"] == 1
+    assert status["write_on_evict_persisted"] == 1
+    assert status["write_on_evict_timeouts"] == 0
+
+
+def test_retried_write_keeps_the_first_request_time_for_the_timeout():
+    retention = CheckpointRetention(
+        write_on_evict=True, persist_timeout=20.0, persist_retry_seconds=5.0
+    )
+    key = make_key(1)
+    with patch("time.monotonic", return_value=100.0):
+        retention.request_persist([key])
+    with patch("time.monotonic", return_value=110.0):
+        retention.record_persist_failed([key])
+    with patch("time.monotonic", return_value=116.0):
+        assert retention.request_persist([key]) == 1
+        assert retention.needs_persist_before_evict(key)
+    with patch("time.monotonic", return_value=121.0):
+        # L2 kept refusing: the page may leave L1 as before.
+        assert not retention.needs_persist_before_evict(key)
+        # A late failure report for a page no longer pending is ignored.
+        retention.record_persist_failed([key])
+    status = retention.report_status()
+    assert status["write_on_evict_timeouts"] == 1
+    assert status["write_on_evict_failures"] == 1
+    assert status["write_on_evict_pending"] == 0
+
+
 def test_superseded_in_adapter_respects_residency_and_budget():
     retention = CheckpointRetention()
     keys = [make_key(i) for i in range(5)]

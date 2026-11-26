@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import enum
 import select
 import threading
+from typing import Callable
 
 # First Party
 from lmcache.logging import init_logger
@@ -294,6 +295,11 @@ class StoreController(StorageControllerInterface):
         l2_adapters: List of L2 adapter instances.
         adapter_descriptors: Descriptors for each L2 adapter (same order).
         policy: The store policy for deciding targets and deletions.
+        on_store_failed: Optional callback given the keys of each store task
+            an adapter failed, so the caller can request the write again.
+        retry_failed_stores: Optional callback run on every store loop pass,
+            at least every ``STORE_LOOP_POLL_TIMEOUT_MS``, so the caller can
+            resubmit failed stores that are due.
     """
 
     # Singleton dispatch for ``lmcache_mp.num_inflight_l2_stores``: tests may
@@ -313,8 +319,14 @@ class StoreController(StorageControllerInterface):
         l2_adapters: list[L2AdapterInterface],
         adapter_descriptors: list[AdapterDescriptor],
         policy: StorePolicy,
+        on_store_failed: Callable[[list[ObjectKey]], None] | None = None,
+        retry_failed_stores: Callable[[], object] | None = None,
     ) -> None:
         self._l1_manager = l1_manager
+        # Called from the store loop with the keys of each failed store task.
+        self._on_store_failed = on_store_failed
+        # Called from the store loop on every pass.
+        self._retry_failed_stores = retry_failed_stores
         self._l2_adapters: dict[int, L2AdapterInterface] = {
             desc.index: adapter
             for desc, adapter in zip(adapter_descriptors, l2_adapters, strict=True)
@@ -606,6 +618,12 @@ class StoreController(StorageControllerInterface):
                             task_key[0],
                             task_key[1],
                         )
+
+            if self._retry_failed_stores is not None:
+                try:
+                    self._retry_failed_stores()
+                except Exception:
+                    logger.exception("Unexpected error retrying failed stores")
 
             # Finalize any draining adapter no longer have any in-flight
             # tasks.
@@ -920,6 +938,8 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 task.keys,
             )
+            if self._on_store_failed is not None:
+                self._on_store_failed(list(task.keys))
 
     def _remember_l2_resident(self, keys: list[ObjectKey]) -> None:
         """Record keys as present in L2, forgetting the oldest beyond the bound."""
